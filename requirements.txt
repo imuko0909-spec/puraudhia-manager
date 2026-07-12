@@ -1,11 +1,2 @@
-main.py
-requirements.txt
-.env.example
-.gitignore
-Procfile
-runtime.txt
-Dockerfile
-render.yaml
-railway.json
-nixpacks.toml
-README.md
+discord.py==2.5.2
+python-dotenv==1.1.0
