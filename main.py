@@ -1398,6 +1398,73 @@ def active_voice_members(guild: discord.Guild) -> list[discord.Member]:
                 result.append(member)
     return result
 
+
+def eligible_member_count(guild: discord.Guild) -> int:
+    """Botと除外ユーザーを除いた現在の人間メンバー数。"""
+    return sum(
+        1
+        for member in guild.members
+        if should_track_member(member)
+    )
+
+
+def participation_rank(rate: float) -> tuple[str, str]:
+    if rate >= 50:
+        return "👑", "LEGEND"
+    if rate >= 40:
+        return "💎", "DIAMOND"
+    if rate >= 30:
+        return "🥇", "GOLD"
+    if rate >= 20:
+        return "🥈", "SILVER"
+    if rate >= 10:
+        return "🥉", "BRONZE"
+    return "🌱", "START"
+
+
+def add_participation_data(
+    stats: dict[str, Any],
+    guild: discord.Guild,
+) -> dict[str, Any]:
+    total = eligible_member_count(guild)
+    rate = (
+        stats["unique_users"] / total * 100
+        if total > 0
+        else 0.0
+    )
+    icon, rank = participation_rank(rate)
+
+    result = dict(stats)
+    result["eligible_members"] = total
+    result["overall_participation_rate"] = rate
+    result["participation_rank_icon"] = icon
+    result["participation_rank"] = rank
+    return result
+
+
+async def average_daily_participation(
+    guild: discord.Guild,
+    days: int,
+) -> tuple[float, float]:
+    """直近N日の日別平均参加率と最高参加率。"""
+    total = eligible_member_count(guild)
+    if total <= 0:
+        return 0.0, 0.0
+
+    rates: list[float] = []
+    for days_ago in range(days):
+        start, end = local_day_bounds(days_ago)
+        if days_ago == 0:
+            end = utcnow()
+
+        daily = await db.stats(guild.id, start, end)
+        rates.append(daily["unique_users"] / total * 100)
+
+    return (
+        sum(rates) / len(rates) if rates else 0.0,
+        max(rates) if rates else 0.0,
+    )
+
 async def is_manager(interaction: discord.Interaction) -> bool:
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
         return False
@@ -1812,11 +1879,22 @@ def stats_embed(
     stats: dict[str, Any],
     *,
     previous: Optional[dict[str, Any]] = None,
+    average_rate: Optional[float] = None,
+    highest_rate: Optional[float] = None,
 ) -> discord.Embed:
-    embed = discord.Embed(title=title, color=EMBED_COLOR, timestamp=utcnow())
+    embed = discord.Embed(
+        title=title,
+        color=EMBED_COLOR,
+        timestamp=utcnow(),
+    )
+
     new_count = stats["new_members"]
     participated = stats["new_vc_members"]
-    rate = (participated / new_count * 100) if new_count else 0
+    new_rate = (
+        participated / new_count * 100
+        if new_count
+        else 0
+    )
 
     embed.add_field(
         name="🎤 VC",
@@ -1828,6 +1906,36 @@ def stats_embed(
         ),
         inline=False,
     )
+
+    if "overall_participation_rate" in stats:
+        lines = [
+            f"対象メンバー: **{stats['eligible_members']}人**",
+            f"VC利用者: **{stats['unique_users']}人**",
+            (
+                f"全体参加率: "
+                f"**{stats['overall_participation_rate']:.1f}%**"
+            ),
+            (
+                f"サーバーランク: "
+                f"**{stats['participation_rank_icon']} "
+                f"{stats['participation_rank']}**"
+            ),
+        ]
+        if average_rate is not None:
+            lines.append(
+                f"日別平均参加率: **{average_rate:.1f}%**"
+            )
+        if highest_rate is not None:
+            lines.append(
+                f"期間内最高参加率: **{highest_rate:.1f}%**"
+            )
+
+        embed.add_field(
+            name="📈 サーバー全体参加率",
+            value="\n".join(lines),
+            inline=False,
+        )
+
     embed.add_field(
         name="👥 メンバー",
         value=(
@@ -1835,16 +1943,18 @@ def stats_embed(
             f"退出: **{stats['leaves']}人**\n"
             f"Kick: **{stats['kicks']}人**\n"
             f"BAN: **{stats['bans']}人**\n"
-            f"純増減: **{stats['joins'] - stats['leaves'] - stats['kicks'] - stats['bans']:+d}人**"
+            f"純増減: "
+            f"**{stats['joins'] - stats['leaves'] - stats['kicks'] - stats['bans']:+d}人**"
         ),
         inline=True,
     )
+
     embed.add_field(
         name="🌱 新規VC参加",
         value=(
             f"対象: **{new_count}人**\n"
             f"VC参加済み: **{participated}人**\n"
-            f"参加率: **{rate:.1f}%**"
+            f"参加率: **{new_rate:.1f}%**"
         ),
         inline=True,
     )
@@ -1858,17 +1968,43 @@ def stats_embed(
         embed.add_field(
             name="📈 前期間との比較",
             value=(
-                f"VC利用者: **{pct(stats['unique_users'], previous['unique_users'])}**\n"
-                f"合計滞在: **{pct(stats['total_seconds'], previous['total_seconds'])}**\n"
-                f"新規加入: **{pct(stats['joins'], previous['joins'])}**"
+                f"VC利用者: "
+                f"**{pct(stats['unique_users'], previous['unique_users'])}**\n"
+                f"合計滞在: "
+                f"**{pct(stats['total_seconds'], previous['total_seconds'])}**\n"
+                f"新規加入: "
+                f"**{pct(stats['joins'], previous['joins'])}**"
             ),
             inline=False,
         )
+
     return embed
 
-async def build_dashboard_embed(guild: discord.Guild) -> discord.Embed:
-    start, end = range_bounds(7)
-    stats = await db.stats(guild.id, start, end)
+async def build_dashboard_embed(
+    guild: discord.Guild,
+) -> discord.Embed:
+    week_start, week_end = range_bounds(7)
+    week_stats = await db.stats(
+        guild.id,
+        week_start,
+        week_end,
+    )
+    week_stats = add_participation_data(
+        week_stats,
+        guild,
+    )
+
+    today_start, _ = local_day_bounds(0)
+    today_stats = await db.stats(
+        guild.id,
+        today_start,
+        utcnow(),
+    )
+    today_stats = add_participation_data(
+        today_stats,
+        guild,
+    )
+
     active = active_voice_members(guild)
 
     embed = discord.Embed(
@@ -1877,36 +2013,75 @@ async def build_dashboard_embed(guild: discord.Guild) -> discord.Embed:
         color=EMBED_COLOR,
         timestamp=utcnow(),
     )
+
     embed.add_field(
         name="🏫 現在",
         value=(
-            f"総メンバー: **{guild.member_count or len(guild.members)}人**\n"
-            f"VC利用者: **{len(active)}人**\n"
-            f"稼働VC: **{len({m.voice.channel.id for m in active if m.voice and m.voice.channel})}部屋**"
+            f"対象メンバー: "
+            f"**{today_stats['eligible_members']}人**\n"
+            f"現在VC: **{len(active)}人**\n"
+            f"稼働VC: "
+            f"**{len({m.voice.channel.id for m in active if m.voice and m.voice.channel})}部屋**"
         ),
         inline=False,
     )
 
     if active:
         lines = []
-        for m in active[:20]:
-            channel_name = m.voice.channel.name if m.voice and m.voice.channel else "不明"
-            lines.append(f"• {m.mention} — **{channel_name}**")
-        embed.add_field(name="🎙️ 現在VC中", value="\n".join(lines), inline=False)
+        for member in active[:20]:
+            channel_name = (
+                member.voice.channel.name
+                if member.voice and member.voice.channel
+                else "不明"
+            )
+            lines.append(
+                f"• {member.mention} — **{channel_name}**"
+            )
+        embed.add_field(
+            name="🎙️ 現在VC中",
+            value="\n".join(lines),
+            inline=False,
+        )
     else:
-        embed.add_field(name="🎙️ 現在VC中", value="現在、VC利用者はいません。", inline=False)
+        embed.add_field(
+            name="🎙️ 現在VC中",
+            value="現在、VC利用者はいません。",
+            inline=False,
+        )
+
+    embed.add_field(
+        name="📈 今日の全体参加率",
+        value=(
+            f"VC利用者: **{today_stats['unique_users']}人**\n"
+            f"参加率: "
+            f"**{today_stats['overall_participation_rate']:.1f}%**\n"
+            f"サーバーランク: "
+            f"**{today_stats['participation_rank_icon']} "
+            f"{today_stats['participation_rank']}**\n"
+            f"最大同時接続: "
+            f"**{today_stats['max_concurrent']}人**"
+        ),
+        inline=False,
+    )
 
     embed.add_field(
         name="📊 直近7日",
         value=(
-            f"利用者: **{stats['unique_users']}人**\n"
-            f"合計滞在: **{fmt_duration(stats['total_seconds'])}**\n"
-            f"最大同時接続: **{stats['max_concurrent']}人**\n"
-            f"加入 / 退出: **{stats['joins']} / {stats['leaves'] + stats['kicks'] + stats['bans']}**"
+            f"期間内利用者: **{week_stats['unique_users']}人**\n"
+            f"期間内参加率: "
+            f"**{week_stats['overall_participation_rate']:.1f}%**\n"
+            f"合計滞在: "
+            f"**{fmt_duration(week_stats['total_seconds'])}**\n"
+            f"加入 / 退出: "
+            f"**{week_stats['joins']} / "
+            f"{week_stats['leaves'] + week_stats['kicks'] + week_stats['bans']}**"
         ),
         inline=False,
     )
-    embed.set_footer(text=f"{DASHBOARD_UPDATE_MINUTES}分ごとに自動更新")
+
+    embed.set_footer(
+        text=f"{DASHBOARD_UPDATE_MINUTES}分ごとに自動更新"
+    )
     return embed
 
 # =========================================================
@@ -1917,34 +2092,229 @@ async def build_dashboard_embed(guild: discord.Guild) -> discord.Embed:
 @app_commands.guilds(target_guild())
 @manager_only()
 async def today_stats(interaction: discord.Interaction) -> None:
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await interaction.response.defer(
+        ephemeral=True,
+        thinking=True,
+    )
     start, _ = local_day_bounds(0)
-    stats = await db.stats(interaction.guild_id, start, utcnow())
-    await private_reply(interaction, embed=stats_embed("📊 今日の統計", stats))
+    stats = await db.stats(
+        interaction.guild_id,
+        start,
+        utcnow(),
+    )
+    stats = add_participation_data(
+        stats,
+        interaction.guild,
+    )
+    await private_reply(
+        interaction,
+        embed=stats_embed("📊 今日の統計", stats),
+    )
 
 @bot.tree.command(name="週間統計", description="直近7日間と、その前7日間を比較します。")
 @app_commands.guilds(target_guild())
 @manager_only()
 async def weekly_stats(interaction: discord.Interaction) -> None:
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await interaction.response.defer(
+        ephemeral=True,
+        thinking=True,
+    )
     end = utcnow()
     start = range_bounds(7)[0]
     previous_start = start - timedelta(days=7)
-    current = await db.stats(interaction.guild_id, start, end)
-    previous = await db.stats(interaction.guild_id, previous_start, start)
-    await private_reply(interaction, embed=stats_embed("📈 週間統計（直近7日）", current, previous=previous))
+
+    current = await db.stats(
+        interaction.guild_id,
+        start,
+        end,
+    )
+    previous = await db.stats(
+        interaction.guild_id,
+        previous_start,
+        start,
+    )
+
+    current = add_participation_data(
+        current,
+        interaction.guild,
+    )
+    previous = add_participation_data(
+        previous,
+        interaction.guild,
+    )
+    average_rate, highest_rate = (
+        await average_daily_participation(
+            interaction.guild,
+            7,
+        )
+    )
+
+    await private_reply(
+        interaction,
+        embed=stats_embed(
+            "📈 週間統計（直近7日）",
+            current,
+            previous=previous,
+            average_rate=average_rate,
+            highest_rate=highest_rate,
+        ),
+    )
 
 @bot.tree.command(name="月間統計", description="直近30日間と、その前30日間を比較します。")
 @app_commands.guilds(target_guild())
 @manager_only()
 async def monthly_stats(interaction: discord.Interaction) -> None:
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await interaction.response.defer(
+        ephemeral=True,
+        thinking=True,
+    )
     end = utcnow()
     start = range_bounds(30)[0]
     previous_start = start - timedelta(days=30)
-    current = await db.stats(interaction.guild_id, start, end)
-    previous = await db.stats(interaction.guild_id, previous_start, start)
-    await private_reply(interaction, embed=stats_embed("📆 月間統計（直近30日）", current, previous=previous))
+
+    current = await db.stats(
+        interaction.guild_id,
+        start,
+        end,
+    )
+    previous = await db.stats(
+        interaction.guild_id,
+        previous_start,
+        start,
+    )
+
+    current = add_participation_data(
+        current,
+        interaction.guild,
+    )
+    previous = add_participation_data(
+        previous,
+        interaction.guild,
+    )
+    average_rate, highest_rate = (
+        await average_daily_participation(
+            interaction.guild,
+            30,
+        )
+    )
+
+    await private_reply(
+        interaction,
+        embed=stats_embed(
+            "📆 月間統計（直近30日）",
+            current,
+            previous=previous,
+            average_rate=average_rate,
+            highest_rate=highest_rate,
+        ),
+    )
+
+@bot.tree.command(
+    name="全体参加率",
+    description="今日・7日平均・30日平均のVC参加率を表示します。",
+)
+@app_commands.guilds(target_guild())
+@manager_only()
+async def overall_participation(
+    interaction: discord.Interaction,
+) -> None:
+    await interaction.response.defer(
+        ephemeral=True,
+        thinking=True,
+    )
+
+    guild = interaction.guild
+    total = eligible_member_count(guild)
+
+    today_start, _ = local_day_bounds(0)
+    today = await db.stats(
+        interaction.guild_id,
+        today_start,
+        utcnow(),
+    )
+    today = add_participation_data(today, guild)
+
+    week_average, week_highest = (
+        await average_daily_participation(guild, 7)
+    )
+    month_average, month_highest = (
+        await average_daily_participation(guild, 30)
+    )
+
+    current_rate = today["overall_participation_rate"]
+    current_icon, current_rank = participation_rank(
+        current_rate
+    )
+
+    next_target_text = "👑 最高ランク達成！"
+    for target, name in (
+        (10, "BRONZE"),
+        (20, "SILVER"),
+        (30, "GOLD"),
+        (40, "DIAMOND"),
+        (50, "LEGEND"),
+    ):
+        if current_rate < target:
+            needed = max(
+                1,
+                int(
+                    target / 100 * total
+                    - today["unique_users"]
+                    + 0.9999
+                ),
+            )
+            next_target_text = (
+                f"次の **{name}** まであと "
+                f"**{target - current_rate:.1f}%**"
+                f"（約{needed}人）"
+            )
+            break
+
+    embed = discord.Embed(
+        title="📈 Puraudhia 全体参加率",
+        color=EMBED_COLOR,
+        timestamp=utcnow(),
+    )
+    embed.add_field(
+        name="📊 今日",
+        value=(
+            f"対象メンバー: **{total}人**\n"
+            f"VC利用者: **{today['unique_users']}人**\n"
+            f"参加率: **{current_rate:.1f}%**\n"
+            f"ランク: **{current_icon} {current_rank}**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="📅 直近7日",
+        value=(
+            f"日別平均: **{week_average:.1f}%**\n"
+            f"最高記録: **{week_highest:.1f}%**"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="🗓️ 直近30日",
+        value=(
+            f"日別平均: **{month_average:.1f}%**\n"
+            f"最高記録: **{month_highest:.1f}%**"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="🎯 次の目標",
+        value=next_target_text,
+        inline=False,
+    )
+    embed.set_footer(
+        text="Botと除外ユーザーは分母に含みません。"
+    )
+
+    await private_reply(
+        interaction,
+        embed=embed,
+    )
+
 
 @bot.tree.command(name="vcランキング", description="指定期間のVC滞在時間ランキングを表示します。")
 @app_commands.describe(日数="1〜90日")
@@ -2682,9 +3052,14 @@ async def daily_summary_loop() -> None:
 
     start, end = local_day_bounds(1)
     stats = await db.stats(guild.id, start, end)
+    stats = add_participation_data(stats, guild)
+
     channel = guild.get_channel(MANAGEMENT_LOG_CHANNEL_ID)
     if isinstance(channel, discord.TextChannel):
-        embed = stats_embed(f"📅 日次レポート｜{start.astimezone(TZ).date()}", stats)
+        embed = stats_embed(
+            f"📅 日次レポート｜{start.astimezone(TZ).date()}",
+            stats,
+        )
         try:
             await channel.send(embed=embed)
             await db.set_setting(guild.id, "last_daily_summary", today_key)
