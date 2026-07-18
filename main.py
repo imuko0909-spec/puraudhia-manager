@@ -1,45 +1,47 @@
 # -*- coding: utf-8 -*-
 """
-Puraudhia Manager
-運営専用Discord管理Bot（discord.py 2.x）
+Puraudhia Management Bot - 運営専用 完成版
+discord.py 2.x / Python 3.11+
 
-【固定設定済み】
-GUILD_ID = 1458016711344263170
-ADMIN_ROLE_ID = 1468161318635962451
-MANAGEMENT_LOG_CHANNEL_ID = 1523582826623008863
-JOIN_LEAVE_LOG_CHANNEL_ID = 1472429718144811050
-DASHBOARD_CHANNEL_ID = 1467734039883677856
-
-【主な機能】
-- VC入室・退出・移動・滞在時間の自動記録
-- 今日 / 7日 / 30日の利用統計
-- 最大同時接続・利用者数・総滞在時間・開始回数
-- 加入 / 退出 / Kick / BAN / Unban の管理ログ
+主な機能
+- 指定カテゴリーのHoliday（お休みDAY）一括休止・復元
+- 毎週土曜0:00休止 / 月曜0:00再開（日本時間）
+- VC・テキストの権限を休止前の状態へ正確に復元
+- 自動更新管理ダッシュボード
+- VC入退室・滞在時間の記録
+- 加入・退出・BAN・Unban・メッセージ削除/編集ログ
 - ロール・ニックネーム・タイムアウト変更ログ
-- メンバーカルテ
-- 面接記録
-- 警告記録
-- 管理メモ
-- 新規VC未参加一覧
-- VC休眠メンバー一覧
-- 自動更新ダッシュボード
-- CSV出力
-- 全Slashコマンド管理者専用・Ephemeral表示
+- 警告・管理メモ・メンバーカルテ
+- Timeout / Kick / BAN
+- チャンネルロック・解除
+- 設定バックアップ（JSON）
+- SQLite保存
+- 毎日0時のデイリーミッション自動投稿
+- VC滞在・VC参加・チャットミッション自動判定
+- 達成一覧・報酬配布待ち・配布済み管理
+- 全管理コマンドを管理者または指定管理ロールのみに制限
 
-【重要】
-- 天真爛漫Botとは別トークン・別DBで動作します。
-- 一般メンバーへDMや公開返信はしません。
-- Kick/BAN判定にはBotの「監査ログを表示」権限が必要です。
+必要権限
+- チャンネル管理
+- ロール管理
+- メンバーを管理
+- メッセージ管理
+- 監査ログを表示
+- メンバーをタイムアウト
+- Kick / BAN（使用する場合）
+
+Developer Portalで有効化
+- SERVER MEMBERS INTENT
+- MESSAGE CONTENT INTENT
 """
 
 from __future__ import annotations
 
 import asyncio
-import csv
 import io
+import json
 import logging
 import os
-import random
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -60,134 +62,47 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 
-GUILD_ID = 1458016711344263170
-ADMIN_ROLE_ID = 1468161318635962451
-MANAGEMENT_LOG_CHANNEL_ID = 1523582826623008863
-JOIN_LEAVE_LOG_CHANNEL_ID = 1472429718144811050
-DASHBOARD_CHANNEL_ID = 1467734039883677856
-
-DB_PATH = Path(os.getenv("DB_PATH", "puraudhia_manager.db"))
-TIMEZONE_NAME = "Asia/Tokyo"
-TZ = ZoneInfo(TIMEZONE_NAME)
-
-DASHBOARD_UPDATE_MINUTES = 5
-DAILY_SUMMARY_HOUR = 0
-DAILY_SUMMARY_MINUTE = 5
-
-EXCLUDED_VOICE_CATEGORY_IDS: set[int] = set()
-EXCLUDED_USER_IDS: set[int] = set()
-
-EMBED_COLOR = discord.Color.from_rgb(137, 107, 255)
-
-
-# =========================================================
-# 放課後ミッション設定
-# =========================================================
-
-MISSION_CHECK_SECONDS = 60
-
-MISSION_POOL = [
-    {
-        "code": "vc15",
-        "name": "放課後に顔を出そう",
-        "description": "VCで合計15分過ごす",
-        "kind": "vc_minutes",
-        "target": 15,
-        "reward": 50,
-        "difficulty": "EASY",
-    },
-    {
-        "code": "vc30",
-        "name": "放課後の雑談",
-        "description": "VCで合計30分過ごす",
-        "kind": "vc_minutes",
-        "target": 30,
-        "reward": 100,
-        "difficulty": "NORMAL",
-    },
-    {
-        "code": "vc60",
-        "name": "たっぷり放課後",
-        "description": "VCで合計60分過ごす",
-        "kind": "vc_minutes",
-        "target": 60,
-        "reward": 180,
-        "difficulty": "HARD",
-    },
-    {
-        "code": "group3_20",
-        "name": "三人寄れば放課後",
-        "description": "3人以上いる同じVCで20分過ごす",
-        "kind": "group_minutes",
-        "target": 20,
-        "required_people": 3,
-        "reward": 150,
-        "difficulty": "NORMAL",
-    },
-    {
-        "code": "group4_15",
-        "name": "放課後ミニパーティー",
-        "description": "4人以上いる同じVCで15分過ごす",
-        "kind": "group_minutes",
-        "target": 15,
-        "required_people": 4,
-        "reward": 180,
-        "difficulty": "HARD",
-    },
-    {
-        "code": "group5_10",
-        "name": "賑やかな教室",
-        "description": "5人以上いる同じVCで10分過ごす",
-        "kind": "group_minutes",
-        "target": 10,
-        "required_people": 5,
-        "reward": 220,
-        "difficulty": "RARE",
-    },
-    {
-        "code": "game20",
-        "name": "放課後ゲーム部",
-        "description": "ゲーム系VCで20分過ごす",
-        "kind": "game_minutes",
-        "target": 20,
-        "reward": 130,
-        "difficulty": "NORMAL",
-    },
-    {
-        "code": "night30",
-        "name": "居残り補習",
-        "description": "22時〜翌2時の間にVCで30分過ごす",
-        "kind": "night_minutes",
-        "target": 30,
-        "reward": 180,
-        "difficulty": "HARD",
-    },
-]
-
-GAME_CHANNEL_KEYWORDS = (
-    "ゲーム", "game", "麻雀", "マイクラ", "原神",
-    "valorant", "apex", "モンハン", "スプラ",
+# 既存Puraudhia管理Botの設定を初期値として使用
+GUILD_ID = int(os.getenv("GUILD_ID", "1458016711344263170"))
+ADMIN_ROLE_ID = int(os.getenv("ADMIN_ROLE_ID", "1468161318635962451"))
+MANAGEMENT_LOG_CHANNEL_ID = int(
+    os.getenv("MANAGEMENT_LOG_CHANNEL_ID", "1523582826623008863")
+)
+JOIN_LEAVE_LOG_CHANNEL_ID = int(
+    os.getenv("JOIN_LEAVE_LOG_CHANNEL_ID", "1472429718144811050")
+)
+DASHBOARD_CHANNEL_ID = int(
+    os.getenv("DASHBOARD_CHANNEL_ID", "1467734039883677856")
 )
 
-# =========================================================
-# ログ
-# =========================================================
+DB_PATH = Path(os.getenv("DB_PATH", "puraudhia_management.db"))
+TZ = ZoneInfo("Asia/Tokyo")
+
+DASHBOARD_UPDATE_MINUTES = 5
+HOLIDAY_CHECK_SECONDS = 60
+EMBED_COLOR = discord.Color.from_rgb(137, 107, 255)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-log = logging.getLogger("puraudhia-manager")
+log = logging.getLogger("puraudhia-management")
 
 # =========================================================
-# 時刻補助
+# 時刻・共通
 # =========================================================
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
+
+def local_now() -> datetime:
+    return datetime.now(TZ)
+
+
 def to_iso(dt: Optional[datetime] = None) -> str:
     return (dt or utcnow()).astimezone(timezone.utc).isoformat()
+
 
 def parse_dt(value: Optional[str]) -> Optional[datetime]:
     if not value:
@@ -198,67 +113,80 @@ def parse_dt(value: Optional[str]) -> Optional[datetime]:
     except (TypeError, ValueError):
         return None
 
-def local_now() -> datetime:
-    return datetime.now(TZ)
-
-def local_day_bounds(days_ago: int = 0) -> tuple[datetime, datetime]:
-    now = local_now()
-    target = (now - timedelta(days=days_ago)).date()
-    start_local = datetime.combine(target, datetime.min.time(), tzinfo=TZ)
-    end_local = start_local + timedelta(days=1)
-    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
-
-def range_bounds(days: int) -> tuple[datetime, datetime]:
-    now = local_now()
-    start_date = (now - timedelta(days=days - 1)).date()
-    start_local = datetime.combine(start_date, datetime.min.time(), tzinfo=TZ)
-    return start_local.astimezone(timezone.utc), utcnow()
 
 def fmt_dt(dt: Optional[datetime], style: str = "f") -> str:
-    if not dt:
-        return "記録なし"
-    return f"<t:{int(dt.timestamp())}:{style}>"
+    return f"<t:{int(dt.timestamp())}:{style}>" if dt else "記録なし"
+
 
 def fmt_duration(seconds: int | float) -> str:
     seconds = max(0, int(seconds))
-    days, rem = divmod(seconds, 86400)
-    hours, rem = divmod(rem, 3600)
-    minutes, _ = divmod(rem, 60)
+    days, remain = divmod(seconds, 86400)
+    hours, remain = divmod(remain, 3600)
+    minutes, _ = divmod(remain, 60)
     if days:
         return f"{days}日{hours}時間{minutes}分"
     if hours:
         return f"{hours}時間{minutes}分"
     return f"{minutes}分"
 
-def safe_text(value: Optional[str], limit: int = 1000) -> str:
-    text = (value or "").strip()
-    return text[:limit] if text else "なし"
+
+def truncate(value: Any, limit: int = 1000) -> str:
+    text = str(value or "なし")
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
 
 # =========================================================
-# DB
+# Database
 # =========================================================
 
 class Database:
     def __init__(self, path: Path):
         self.path = path
-        self._lock = asyncio.Lock()
+        self.lock = asyncio.Lock()
 
     @contextmanager
     def connect(self):
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
         try:
             yield conn
             conn.commit()
         finally:
             conn.close()
 
-    def initialize(self) -> None:
+    def initialize(self):
         with self.connect() as conn:
             conn.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS settings (
+                    guild_id INTEGER NOT NULL,
+                    key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    PRIMARY KEY (guild_id, key)
+                );
+
+                CREATE TABLE IF NOT EXISTS holiday_categories (
+                    guild_id INTEGER NOT NULL,
+                    category_id INTEGER NOT NULL,
+                    PRIMARY KEY (guild_id, category_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS holiday_backups (
+                    guild_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    target_id INTEGER NOT NULL,
+                    target_type TEXT NOT NULL,
+                    view_channel INTEGER,
+                    connect INTEGER,
+                    send_messages INTEGER,
+                    speak INTEGER,
+                    add_reactions INTEGER,
+                    create_public_threads INTEGER,
+                    send_messages_in_threads INTEGER,
+                    PRIMARY KEY (guild_id, channel_id, target_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS members (
                     guild_id INTEGER NOT NULL,
                     user_id INTEGER NOT NULL,
@@ -269,7 +197,6 @@ class Database:
                     left_at TEXT,
                     first_vc_at TEXT,
                     last_vc_at TEXT,
-                    last_activity_at TEXT,
                     PRIMARY KEY (guild_id, user_id)
                 );
 
@@ -279,39 +206,10 @@ class Database:
                     user_id INTEGER NOT NULL,
                     channel_id INTEGER NOT NULL,
                     channel_name TEXT,
-                    category_id INTEGER,
                     started_at TEXT NOT NULL,
                     ended_at TEXT,
                     duration_seconds INTEGER DEFAULT 0
                 );
-
-                CREATE INDEX IF NOT EXISTS idx_voice_sessions_range
-                ON voice_sessions(guild_id, started_at, ended_at);
-
-                CREATE INDEX IF NOT EXISTS idx_voice_sessions_user
-                ON voice_sessions(guild_id, user_id, started_at);
-
-                CREATE TABLE IF NOT EXISTS voice_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    guild_id INTEGER NOT NULL,
-                    user_id INTEGER NOT NULL,
-                    event_type TEXT NOT NULL,
-                    before_channel_id INTEGER,
-                    after_channel_id INTEGER,
-                    before_channel_name TEXT,
-                    after_channel_name TEXT,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS concurrency_samples (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    guild_id INTEGER NOT NULL,
-                    concurrent_users INTEGER NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_concurrency_range
-                ON concurrency_samples(guild_id, created_at);
 
                 CREATE TABLE IF NOT EXISTS member_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -322,25 +220,6 @@ class Database:
                     details TEXT,
                     created_at TEXT NOT NULL
                 );
-
-                CREATE INDEX IF NOT EXISTS idx_member_events_range
-                ON member_events(guild_id, event_type, created_at);
-
-                CREATE TABLE IF NOT EXISTS interviews (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    guild_id INTEGER NOT NULL,
-                    user_id INTEGER NOT NULL,
-                    interviewer_id INTEGER NOT NULL,
-                    result TEXT NOT NULL,
-                    source TEXT,
-                    ban_history TEXT,
-                    same_gender_ok TEXT,
-                    memo TEXT,
-                    interviewed_at TEXT NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_interviews_user
-                ON interviews(guild_id, user_id, interviewed_at);
 
                 CREATE TABLE IF NOT EXISTS warnings (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -354,9 +233,6 @@ class Database:
                     resolved_by INTEGER
                 );
 
-                CREATE INDEX IF NOT EXISTS idx_warnings_user
-                ON warnings(guild_id, user_id, is_active);
-
                 CREATE TABLE IF NOT EXISTS notes (
                     guild_id INTEGER NOT NULL,
                     user_id INTEGER NOT NULL,
@@ -366,80 +242,182 @@ class Database:
                     PRIMARY KEY (guild_id, user_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS missions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    mission_type TEXT NOT NULL,
+                    target_value INTEGER NOT NULL DEFAULT 1,
+                    reward_points INTEGER NOT NULL DEFAULT 0,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_by INTEGER,
+                    created_at TEXT NOT NULL
+                );
 
-                CREATE TABLE IF NOT EXISTS daily_missions (
+                CREATE TABLE IF NOT EXISTS mission_days (
                     guild_id INTEGER NOT NULL,
                     mission_date TEXT NOT NULL,
-                    slot INTEGER NOT NULL,
-                    mission_code TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    description TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    target INTEGER NOT NULL,
-                    required_people INTEGER NOT NULL DEFAULT 1,
-                    reward INTEGER NOT NULL,
-                    difficulty TEXT NOT NULL,
-                    PRIMARY KEY (guild_id, mission_date, slot)
+                    message_id INTEGER,
+                    channel_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    closed_at TEXT,
+                    PRIMARY KEY (guild_id, mission_date)
                 );
 
                 CREATE TABLE IF NOT EXISTS mission_progress (
                     guild_id INTEGER NOT NULL,
                     mission_date TEXT NOT NULL,
+                    mission_id INTEGER NOT NULL,
                     user_id INTEGER NOT NULL,
-                    mission_code TEXT NOT NULL,
-                    progress_seconds INTEGER NOT NULL DEFAULT 0,
+                    progress_value INTEGER NOT NULL DEFAULT 0,
                     completed_at TEXT,
-                    PRIMARY KEY (guild_id, mission_date, user_id, mission_code)
-                );
-
-                CREATE TABLE IF NOT EXISTS reward_queue (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    guild_id INTEGER NOT NULL,
-                    mission_date TEXT NOT NULL,
-                    user_id INTEGER NOT NULL,
-                    mission_code TEXT NOT NULL,
-                    mission_name TEXT NOT NULL,
-                    points INTEGER NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    created_at TEXT NOT NULL,
-                    completed_at TEXT,
-                    completed_by INTEGER,
-                    UNIQUE (guild_id, mission_date, user_id, mission_code)
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_reward_queue_status
-                ON reward_queue(guild_id, status, created_at);
-
-                CREATE TABLE IF NOT EXISTS settings (
-                    guild_id INTEGER NOT NULL,
-                    key TEXT NOT NULL,
-                    value TEXT NOT NULL,
-                    PRIMARY KEY (guild_id, key)
+                    reward_status TEXT NOT NULL DEFAULT 'pending',
+                    rewarded_at TEXT,
+                    rewarded_by INTEGER,
+                    PRIMARY KEY (guild_id, mission_date, mission_id, user_id)
                 );
                 """
             )
 
-    async def run(self, func, *args):
-        async with self._lock:
-            return await asyncio.to_thread(func, *args)
+    async def run(self, fn, *args):
+        async with self.lock:
+            return await asyncio.to_thread(fn, *args)
 
-    def _upsert_member(self, member: discord.Member) -> None:
+    def _get_setting(self, guild_id: int, key: str, default: Optional[str] = None):
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM settings WHERE guild_id=? AND key=?",
+                (guild_id, key),
+            ).fetchone()
+            return row["value"] if row else default
+
+    async def get_setting(self, guild_id: int, key: str, default: Optional[str] = None):
+        return await self.run(self._get_setting, guild_id, key, default)
+
+    def _set_setting(self, guild_id: int, key: str, value: Any):
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO settings(guild_id,key,value)
+                VALUES(?,?,?)
+                ON CONFLICT(guild_id,key) DO UPDATE SET value=excluded.value
+                """,
+                (guild_id, key, str(value)),
+            )
+
+    async def set_setting(self, guild_id: int, key: str, value: Any):
+        await self.run(self._set_setting, guild_id, key, value)
+
+    def _add_holiday_category(self, guild_id: int, category_id: int):
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO holiday_categories VALUES(?,?)",
+                (guild_id, category_id),
+            )
+
+    async def add_holiday_category(self, guild_id: int, category_id: int):
+        await self.run(self._add_holiday_category, guild_id, category_id)
+
+    def _remove_holiday_category(self, guild_id: int, category_id: int):
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM holiday_categories WHERE guild_id=? AND category_id=?",
+                (guild_id, category_id),
+            )
+
+    async def remove_holiday_category(self, guild_id: int, category_id: int):
+        await self.run(self._remove_holiday_category, guild_id, category_id)
+
+    def _holiday_categories(self, guild_id: int):
+        with self.connect() as conn:
+            return [
+                int(r["category_id"])
+                for r in conn.execute(
+                    "SELECT category_id FROM holiday_categories WHERE guild_id=?",
+                    (guild_id,),
+                )
+            ]
+
+    async def holiday_categories(self, guild_id: int):
+        return await self.run(self._holiday_categories, guild_id)
+
+    def _save_permission_backup(
+        self,
+        guild_id: int,
+        channel_id: int,
+        target_id: int,
+        target_type: str,
+        overwrite: discord.PermissionOverwrite,
+    ):
+        def tri(value: Optional[bool]):
+            return None if value is None else int(value)
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO holiday_backups(
+                    guild_id, channel_id, target_id, target_type,
+                    view_channel, connect, send_messages, speak,
+                    add_reactions, create_public_threads, send_messages_in_threads
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    guild_id,
+                    channel_id,
+                    target_id,
+                    target_type,
+                    tri(overwrite.view_channel),
+                    tri(overwrite.connect),
+                    tri(overwrite.send_messages),
+                    tri(overwrite.speak),
+                    tri(overwrite.add_reactions),
+                    tri(overwrite.create_public_threads),
+                    tri(overwrite.send_messages_in_threads),
+                ),
+            )
+
+    async def save_permission_backup(self, *args):
+        await self.run(self._save_permission_backup, *args)
+
+    def _permission_backups(self, guild_id: int):
+        with self.connect() as conn:
+            return [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM holiday_backups WHERE guild_id=?",
+                    (guild_id,),
+                )
+            ]
+
+    async def permission_backups(self, guild_id: int):
+        return await self.run(self._permission_backups, guild_id)
+
+    def _clear_permission_backups(self, guild_id: int):
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM holiday_backups WHERE guild_id=?",
+                (guild_id,),
+            )
+
+    async def clear_permission_backups(self, guild_id: int):
+        await self.run(self._clear_permission_backups, guild_id)
+
+    def _upsert_member(self, member: discord.Member):
         now = to_iso()
         joined = to_iso(member.joined_at) if member.joined_at else None
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO members (
-                    guild_id, user_id, username, display_name, joined_at,
-                    first_seen_at, left_at, last_activity_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
-                ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                INSERT INTO members(
+                    guild_id,user_id,username,display_name,joined_at,
+                    first_seen_at,left_at
+                ) VALUES(?,?,?,?,?,?,NULL)
+                ON CONFLICT(guild_id,user_id) DO UPDATE SET
                     username=excluded.username,
                     display_name=excluded.display_name,
-                    joined_at=COALESCE(members.joined_at, excluded.joined_at),
-                    left_at=NULL,
-                    last_activity_at=excluded.last_activity_at
+                    joined_at=COALESCE(members.joined_at,excluded.joined_at),
+                    left_at=NULL
                 """,
                 (
                     member.guild.id,
@@ -448,80 +426,60 @@ class Database:
                     member.display_name,
                     joined,
                     now,
-                    now,
                 ),
             )
 
-    async def upsert_member(self, member: discord.Member) -> None:
+    async def upsert_member(self, member: discord.Member):
         await self.run(self._upsert_member, member)
 
-    def _mark_left(self, guild_id: int, user_id: int) -> None:
-        now = to_iso()
+    def _mark_left(self, guild_id: int, user_id: int):
         with self.connect() as conn:
             conn.execute(
-                """
-                UPDATE members
-                SET left_at=?, last_activity_at=?
-                WHERE guild_id=? AND user_id=?
-                """,
-                (now, now, guild_id, user_id),
+                "UPDATE members SET left_at=? WHERE guild_id=? AND user_id=?",
+                (to_iso(), guild_id, user_id),
             )
 
-    async def mark_left(self, guild_id: int, user_id: int) -> None:
+    async def mark_left(self, guild_id: int, user_id: int):
         await self.run(self._mark_left, guild_id, user_id)
 
-    def _start_voice_session(self, member: discord.Member, channel: discord.abc.GuildChannel) -> None:
+    def _start_voice(self, member: discord.Member, channel: discord.abc.GuildChannel):
         now = to_iso()
-        category_id = getattr(channel, "category_id", None)
         with self.connect() as conn:
-            existing = conn.execute(
+            open_row = conn.execute(
                 """
                 SELECT id FROM voice_sessions
                 WHERE guild_id=? AND user_id=? AND ended_at IS NULL
-                ORDER BY id DESC LIMIT 1
                 """,
                 (member.guild.id, member.id),
             ).fetchone()
-            if existing:
+            if open_row:
                 return
-
             conn.execute(
                 """
-                INSERT INTO voice_sessions (
-                    guild_id, user_id, channel_id, channel_name,
-                    category_id, started_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO voice_sessions(
+                    guild_id,user_id,channel_id,channel_name,started_at
+                ) VALUES(?,?,?,?,?)
                 """,
-                (
-                    member.guild.id,
-                    member.id,
-                    channel.id,
-                    channel.name,
-                    category_id,
-                    now,
-                ),
+                (member.guild.id, member.id, channel.id, channel.name, now),
             )
             conn.execute(
                 """
                 UPDATE members
-                SET first_vc_at=COALESCE(first_vc_at, ?),
-                    last_vc_at=?,
-                    last_activity_at=?
+                SET first_vc_at=COALESCE(first_vc_at,?),last_vc_at=?
                 WHERE guild_id=? AND user_id=?
                 """,
-                (now, now, now, member.guild.id, member.id),
+                (now, now, member.guild.id, member.id),
             )
 
-    async def start_voice_session(self, member: discord.Member, channel: discord.abc.GuildChannel) -> None:
-        await self.run(self._start_voice_session, member, channel)
+    async def start_voice(self, member: discord.Member, channel):
+        await self.run(self._start_voice, member, channel)
 
-    def _end_voice_session(self, guild_id: int, user_id: int) -> int:
-        now_dt = utcnow()
+    def _end_voice(self, guild_id: int, user_id: int):
+        now = utcnow()
         with self.connect() as conn:
             row = conn.execute(
                 """
-                SELECT id, started_at FROM voice_sessions
+                SELECT id,started_at FROM voice_sessions
                 WHERE guild_id=? AND user_id=? AND ended_at IS NULL
                 ORDER BY id DESC LIMIT 1
                 """,
@@ -529,176 +487,99 @@ class Database:
             ).fetchone()
             if not row:
                 return 0
-
-            started = parse_dt(row["started_at"]) or now_dt
-            duration = max(0, int((now_dt - started).total_seconds()))
+            started = parse_dt(row["started_at"]) or now
+            seconds = max(0, int((now - started).total_seconds()))
             conn.execute(
                 """
                 UPDATE voice_sessions
-                SET ended_at=?, duration_seconds=?
+                SET ended_at=?,duration_seconds=?
                 WHERE id=?
                 """,
-                (to_iso(now_dt), duration, row["id"]),
+                (to_iso(now), seconds, row["id"]),
             )
             conn.execute(
-                """
-                UPDATE members
-                SET last_vc_at=?, last_activity_at=?
-                WHERE guild_id=? AND user_id=?
-                """,
-                (to_iso(now_dt), to_iso(now_dt), guild_id, user_id),
+                "UPDATE members SET last_vc_at=? WHERE guild_id=? AND user_id=?",
+                (to_iso(now), guild_id, user_id),
             )
-            return duration
+            return seconds
 
-    async def end_voice_session(self, guild_id: int, user_id: int) -> int:
-        return await self.run(self._end_voice_session, guild_id, user_id)
+    async def end_voice(self, guild_id: int, user_id: int):
+        return await self.run(self._end_voice, guild_id, user_id)
 
-    def _record_voice_event(
-        self,
-        guild_id: int,
-        user_id: int,
-        event_type: str,
-        before: Optional[discord.abc.GuildChannel],
-        after: Optional[discord.abc.GuildChannel],
-    ) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO voice_events (
-                    guild_id, user_id, event_type,
-                    before_channel_id, after_channel_id,
-                    before_channel_name, after_channel_name, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    guild_id,
-                    user_id,
-                    event_type,
-                    before.id if before else None,
-                    after.id if after else None,
-                    before.name if before else None,
-                    after.name if after else None,
-                    to_iso(),
-                ),
-            )
-
-    async def record_voice_event(self, *args) -> None:
-        await self.run(self._record_voice_event, *args)
-
-    def _record_concurrency(self, guild_id: int, count: int) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO concurrency_samples (
-                    guild_id, concurrent_users, created_at
-                ) VALUES (?, ?, ?)
-                """,
-                (guild_id, count, to_iso()),
-            )
-
-    async def record_concurrency(self, guild_id: int, count: int) -> None:
-        await self.run(self._record_concurrency, guild_id, count)
-
-    def _add_member_event(
+    def _add_event(
         self,
         guild_id: int,
         user_id: int,
         event_type: str,
         actor_id: Optional[int] = None,
         details: Optional[str] = None,
-    ) -> None:
+    ):
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO member_events (
-                    guild_id, user_id, event_type,
-                    actor_id, details, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO member_events(
+                    guild_id,user_id,event_type,actor_id,details,created_at
+                ) VALUES(?,?,?,?,?,?)
                 """,
                 (guild_id, user_id, event_type, actor_id, details, to_iso()),
             )
 
-    async def add_member_event(self, *args) -> None:
-        await self.run(self._add_member_event, *args)
+    async def add_event(self, *args):
+        await self.run(self._add_event, *args)
 
-    def _add_interview(
-        self,
-        guild_id: int,
-        user_id: int,
-        interviewer_id: int,
-        result: str,
-        source: str,
-        ban_history: str,
-        same_gender_ok: str,
-        memo: str,
-    ) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO interviews (
-                    guild_id, user_id, interviewer_id, result, source,
-                    ban_history, same_gender_ok, memo, interviewed_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    guild_id,
-                    user_id,
-                    interviewer_id,
-                    result,
-                    source,
-                    ban_history,
-                    same_gender_ok,
-                    memo,
-                    to_iso(),
-                ),
-            )
-
-    async def add_interview(self, *args) -> None:
-        await self.run(self._add_interview, *args)
-
-    def _add_warning(self, guild_id: int, user_id: int, moderator_id: int, reason: str) -> int:
+    def _add_warning(self, guild_id: int, user_id: int, moderator_id: int, reason: str):
         with self.connect() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO warnings (
-                    guild_id, user_id, moderator_id, reason, created_at
-                )
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO warnings(
+                    guild_id,user_id,moderator_id,reason,created_at
+                ) VALUES(?,?,?,?,?)
                 """,
                 (guild_id, user_id, moderator_id, reason, to_iso()),
             )
             return int(cur.lastrowid)
 
-    async def add_warning(self, *args) -> int:
+    async def add_warning(self, *args):
         return await self.run(self._add_warning, *args)
 
-    def _resolve_warning(self, guild_id: int, warning_id: int, resolver_id: int) -> bool:
+    def _warnings(self, guild_id: int, user_id: int):
+        with self.connect() as conn:
+            return [
+                dict(r)
+                for r in conn.execute(
+                    """
+                    SELECT * FROM warnings
+                    WHERE guild_id=? AND user_id=?
+                    ORDER BY created_at DESC LIMIT 20
+                    """,
+                    (guild_id, user_id),
+                )
+            ]
+
+    async def warnings(self, guild_id: int, user_id: int):
+        return await self.run(self._warnings, guild_id, user_id)
+
+    def _resolve_warning(self, guild_id: int, warning_id: int, moderator_id: int):
         with self.connect() as conn:
             cur = conn.execute(
                 """
-                UPDATE warnings
-                SET is_active=0, resolved_at=?, resolved_by=?
+                UPDATE warnings SET is_active=0,resolved_at=?,resolved_by=?
                 WHERE guild_id=? AND id=? AND is_active=1
                 """,
-                (to_iso(), resolver_id, guild_id, warning_id),
+                (to_iso(), moderator_id, guild_id, warning_id),
             )
             return cur.rowcount > 0
 
-    async def resolve_warning(self, *args) -> bool:
+    async def resolve_warning(self, *args):
         return await self.run(self._resolve_warning, *args)
 
-    def _set_note(self, guild_id: int, user_id: int, note: str, editor_id: int) -> None:
+    def _set_note(self, guild_id: int, user_id: int, note: str, editor_id: int):
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO notes (
-                    guild_id, user_id, note, updated_by, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                INSERT INTO notes(guild_id,user_id,note,updated_by,updated_at)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(guild_id,user_id) DO UPDATE SET
                     note=excluded.note,
                     updated_by=excluded.updated_by,
                     updated_at=excluded.updated_at
@@ -706,786 +587,494 @@ class Database:
                 (guild_id, user_id, note, editor_id, to_iso()),
             )
 
-    async def set_note(self, *args) -> None:
+    async def set_note(self, *args):
         await self.run(self._set_note, *args)
 
-    def _get_setting(self, guild_id: int, key: str) -> Optional[str]:
-        with self.connect() as conn:
-            row = conn.execute(
-                "SELECT value FROM settings WHERE guild_id=? AND key=?",
-                (guild_id, key),
-            ).fetchone()
-            return row["value"] if row else None
-
-    async def get_setting(self, guild_id: int, key: str) -> Optional[str]:
-        return await self.run(self._get_setting, guild_id, key)
-
-    def _set_setting(self, guild_id: int, key: str, value: str) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO settings (guild_id, key, value)
-                VALUES (?, ?, ?)
-                ON CONFLICT(guild_id, key) DO UPDATE SET value=excluded.value
-                """,
-                (guild_id, key, value),
-            )
-
-    async def set_setting(self, guild_id: int, key: str, value: str) -> None:
-        await self.run(self._set_setting, guild_id, key, value)
-
-    def _stats(self, guild_id: int, start: datetime, end: datetime) -> dict[str, Any]:
-        start_iso, end_iso = to_iso(start), to_iso(end)
-        now = utcnow()
-        with self.connect() as conn:
-            sessions = conn.execute(
-                """
-                SELECT user_id, started_at, ended_at
-                FROM voice_sessions
-                WHERE guild_id=?
-                  AND started_at < ?
-                  AND (ended_at IS NULL OR ended_at > ?)
-                """,
-                (guild_id, end_iso, start_iso),
-            ).fetchall()
-
-            unique_users: set[int] = set()
-            total_seconds = 0
-            session_starts = 0
-            for row in sessions:
-                s = parse_dt(row["started_at"]) or start
-                e = parse_dt(row["ended_at"]) or min(now, end)
-                clipped_start = max(s, start)
-                clipped_end = min(e, end)
-                if clipped_end > clipped_start:
-                    unique_users.add(int(row["user_id"]))
-                    total_seconds += int((clipped_end - clipped_start).total_seconds())
-                if start <= s < end:
-                    session_starts += 1
-
-            max_row = conn.execute(
-                """
-                SELECT MAX(concurrent_users) AS max_count
-                FROM concurrency_samples
-                WHERE guild_id=? AND created_at>=? AND created_at<?
-                """,
-                (guild_id, start_iso, end_iso),
-            ).fetchone()
-
-            counts = {}
-            for event_type in ("join", "leave", "kick", "ban", "unban"):
-                row = conn.execute(
-                    """
-                    SELECT COUNT(*) AS c
-                    FROM member_events
-                    WHERE guild_id=? AND event_type=?
-                      AND created_at>=? AND created_at<?
-                    """,
-                    (guild_id, event_type, start_iso, end_iso),
-                ).fetchone()
-                counts[event_type] = int(row["c"] or 0)
-
-            new_members = conn.execute(
-                """
-                SELECT COUNT(*) AS c
-                FROM members
-                WHERE guild_id=? AND joined_at>=? AND joined_at<?
-                """,
-                (guild_id, start_iso, end_iso),
-            ).fetchone()["c"]
-
-            new_vc = conn.execute(
-                """
-                SELECT COUNT(*) AS c
-                FROM members
-                WHERE guild_id=? AND joined_at>=? AND joined_at<?
-                  AND first_vc_at IS NOT NULL
-                  AND first_vc_at<?
-                """,
-                (guild_id, start_iso, end_iso, end_iso),
-            ).fetchone()["c"]
-
-            return {
-                "unique_users": len(unique_users),
-                "total_seconds": total_seconds,
-                "session_starts": session_starts,
-                "max_concurrent": int(max_row["max_count"] or 0),
-                "joins": counts["join"],
-                "leaves": counts["leave"],
-                "kicks": counts["kick"],
-                "bans": counts["ban"],
-                "unbans": counts["unban"],
-                "new_members": int(new_members or 0),
-                "new_vc_members": int(new_vc or 0),
-            }
-
-    async def stats(self, guild_id: int, start: datetime, end: datetime) -> dict[str, Any]:
-        return await self.run(self._stats, guild_id, start, end)
-
-    def _member_card(self, guild_id: int, user_id: int) -> dict[str, Any]:
+    def _member_card(self, guild_id: int, user_id: int):
         with self.connect() as conn:
             member = conn.execute(
                 "SELECT * FROM members WHERE guild_id=? AND user_id=?",
                 (guild_id, user_id),
             ).fetchone()
-
             vc = conn.execute(
                 """
-                SELECT
-                    COUNT(*) AS sessions,
-                    COALESCE(SUM(duration_seconds), 0) AS seconds,
-                    MAX(COALESCE(ended_at, started_at)) AS last_vc
-                FROM voice_sessions
-                WHERE guild_id=? AND user_id=?
+                SELECT COUNT(*) sessions,
+                       COALESCE(SUM(duration_seconds),0) seconds,
+                       MAX(COALESCE(ended_at,started_at)) last_vc
+                FROM voice_sessions WHERE guild_id=? AND user_id=?
                 """,
                 (guild_id, user_id),
             ).fetchone()
-
-            interview = conn.execute(
-                """
-                SELECT * FROM interviews
-                WHERE guild_id=? AND user_id=?
-                ORDER BY interviewed_at DESC LIMIT 1
-                """,
-                (guild_id, user_id),
-            ).fetchone()
-
             warnings = conn.execute(
                 """
-                SELECT COUNT(*) AS c FROM warnings
+                SELECT COUNT(*) c FROM warnings
                 WHERE guild_id=? AND user_id=? AND is_active=1
                 """,
                 (guild_id, user_id),
-            ).fetchone()["c"]
-
+            ).fetchone()
             note = conn.execute(
                 "SELECT * FROM notes WHERE guild_id=? AND user_id=?",
                 (guild_id, user_id),
             ).fetchone()
-
             return {
                 "member": dict(member) if member else None,
-                "vc_sessions": int(vc["sessions"] or 0),
-                "vc_seconds": int(vc["seconds"] or 0),
+                "sessions": int(vc["sessions"] or 0),
+                "seconds": int(vc["seconds"] or 0),
                 "last_vc": vc["last_vc"],
-                "interview": dict(interview) if interview else None,
-                "warning_count": int(warnings or 0),
+                "warnings": int(warnings["c"] or 0),
                 "note": dict(note) if note else None,
             }
 
-    async def member_card(self, guild_id: int, user_id: int) -> dict[str, Any]:
+    async def member_card(self, guild_id: int, user_id: int):
         return await self.run(self._member_card, guild_id, user_id)
 
-    def _warnings(self, guild_id: int, user_id: int, active_only: bool = True) -> list[dict[str, Any]]:
+    def _dashboard_stats(self, guild_id: int, since: datetime):
         with self.connect() as conn:
-            query = "SELECT * FROM warnings WHERE guild_id=? AND user_id=?"
-            params: list[Any] = [guild_id, user_id]
-            if active_only:
-                query += " AND is_active=1"
-            query += " ORDER BY created_at DESC LIMIT 20"
-            return [dict(r) for r in conn.execute(query, params).fetchall()]
-
-    async def warnings(self, guild_id: int, user_id: int, active_only: bool = True) -> list[dict[str, Any]]:
-        return await self.run(self._warnings, guild_id, user_id, active_only)
-
-    def _top_voice(self, guild_id: int, start: datetime, end: datetime, limit: int = 10):
-        start_iso, end_iso = to_iso(start), to_iso(end)
-        with self.connect() as conn:
-            rows = conn.execute(
+            since_iso = to_iso(since)
+            sessions = conn.execute(
                 """
-                SELECT user_id, started_at, ended_at
+                SELECT user_id,duration_seconds,started_at,ended_at
                 FROM voice_sessions
-                WHERE guild_id=?
-                  AND started_at < ?
-                  AND (ended_at IS NULL OR ended_at > ?)
+                WHERE guild_id=? AND started_at>=?
                 """,
-                (guild_id, end_iso, start_iso),
+                (guild_id, since_iso),
             ).fetchall()
-
-        agg: dict[int, list[int]] = {}
-        now = utcnow()
-        for row in rows:
-            uid = int(row["user_id"])
-            s = max(parse_dt(row["started_at"]) or start, start)
-            e = min(parse_dt(row["ended_at"]) or now, end)
-            if e <= s:
-                continue
-            rec = agg.setdefault(uid, [0, 0])
-            rec[0] += int((e - s).total_seconds())
-            rec[1] += 1
-
-        ranked = sorted(
-            ((uid, values[0], values[1]) for uid, values in agg.items()),
-            key=lambda x: x[1],
-            reverse=True,
-        )
-        return ranked[:limit]
-
-    async def top_voice(self, guild_id: int, start: datetime, end: datetime, limit: int = 10):
-        return await self.run(self._top_voice, guild_id, start, end, limit)
-
-    def _new_without_vc(self, guild_id: int, since: datetime, limit: int = 50):
-        with self.connect() as conn:
-            return [
-                dict(r)
-                for r in conn.execute(
-                    """
-                    SELECT * FROM members
-                    WHERE guild_id=?
-                      AND joined_at>=?
-                      AND left_at IS NULL
-                      AND first_vc_at IS NULL
-                    ORDER BY joined_at DESC
-                    LIMIT ?
-                    """,
-                    (guild_id, to_iso(since), limit),
-                ).fetchall()
-            ]
-
-    async def new_without_vc(self, guild_id: int, since: datetime, limit: int = 50):
-        return await self.run(self._new_without_vc, guild_id, since, limit)
-
-    def _inactive_vc(self, guild_id: int, cutoff: datetime, limit: int = 50):
-        with self.connect() as conn:
-            return [
-                dict(r)
-                for r in conn.execute(
-                    """
-                    SELECT * FROM members
-                    WHERE guild_id=?
-                      AND left_at IS NULL
-                      AND (last_vc_at IS NULL OR last_vc_at<?)
-                    ORDER BY COALESCE(last_vc_at, joined_at, first_seen_at) ASC
-                    LIMIT ?
-                    """,
-                    (guild_id, to_iso(cutoff), limit),
-                ).fetchall()
-            ]
-
-    async def inactive_vc(self, guild_id: int, cutoff: datetime, limit: int = 50):
-        return await self.run(self._inactive_vc, guild_id, cutoff, limit)
-
-    def _export_rows(self, guild_id: int, kind: str):
-        table_map = {
-            "vc": """
-                SELECT id, user_id, channel_name, started_at,
-                       ended_at, duration_seconds
-                FROM voice_sessions
-                WHERE guild_id=?
-                ORDER BY started_at DESC
-            """,
-            "面接": """
-                SELECT id, user_id, interviewer_id, result, source,
-                       ban_history, same_gender_ok, memo, interviewed_at
-                FROM interviews
-                WHERE guild_id=?
-                ORDER BY interviewed_at DESC
-            """,
-            "警告": """
-                SELECT id, user_id, moderator_id, reason, created_at,
-                       is_active, resolved_at, resolved_by
-                FROM warnings
-                WHERE guild_id=?
-                ORDER BY created_at DESC
-            """,
-            "メンバー": """
-                SELECT user_id, username, display_name, joined_at,
-                       left_at, first_vc_at, last_vc_at, last_activity_at
-                FROM members
-                WHERE guild_id=?
-                ORDER BY joined_at DESC
-            """,
-        }
-        if kind not in table_map:
-            raise ValueError("不明な出力種別です")
-        with self.connect() as conn:
-            cur = conn.execute(table_map[kind], (guild_id,))
-            return [d[0] for d in cur.description], cur.fetchall()
-
-    async def export_rows(self, guild_id: int, kind: str):
-        return await self.run(self._export_rows, guild_id, kind)
-
-
-    # ---------- 放課後ミッション ----------
-    def _ensure_daily_missions(
-        self,
-        guild_id: int,
-        mission_date: str,
-        reroll: bool = False,
-    ) -> list[dict[str, Any]]:
-        with self.connect() as conn:
-            existing = conn.execute(
+            events = conn.execute(
                 """
-                SELECT * FROM daily_missions
-                WHERE guild_id=? AND mission_date=?
-                ORDER BY slot
+                SELECT event_type,COUNT(*) c FROM member_events
+                WHERE guild_id=? AND created_at>=?
+                GROUP BY event_type
                 """,
-                (guild_id, mission_date),
+                (guild_id, since_iso),
             ).fetchall()
+            return {
+                "unique_vc": len({int(r["user_id"]) for r in sessions}),
+                "vc_seconds": sum(int(r["duration_seconds"] or 0) for r in sessions),
+                "vc_sessions": len(sessions),
+                "events": {r["event_type"]: int(r["c"]) for r in events},
+            }
 
-            if existing and not reroll:
-                return [dict(r) for r in existing]
+    async def dashboard_stats(self, guild_id: int, since: datetime):
+        return await self.run(self._dashboard_stats, guild_id, since)
 
-            if reroll:
-                conn.execute(
-                    "DELETE FROM daily_missions WHERE guild_id=? AND mission_date=?",
-                    (guild_id, mission_date),
-                )
-                conn.execute(
-                    "DELETE FROM mission_progress WHERE guild_id=? AND mission_date=?",
-                    (guild_id, mission_date),
-                )
-                conn.execute(
-                    """
-                    DELETE FROM reward_queue
-                    WHERE guild_id=? AND mission_date=? AND status='pending'
-                    """,
-                    (guild_id, mission_date),
-                )
-
-            selected = random.sample(MISSION_POOL, k=3)
-            for slot, mission in enumerate(selected, 1):
-                conn.execute(
-                    """
-                    INSERT INTO daily_missions (
-                        guild_id, mission_date, slot, mission_code,
-                        name, description, kind, target,
-                        required_people, reward, difficulty
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        guild_id,
-                        mission_date,
-                        slot,
-                        mission["code"],
-                        mission["name"],
-                        mission["description"],
-                        mission["kind"],
-                        mission["target"],
-                        mission.get("required_people", 1),
-                        mission["reward"],
-                        mission["difficulty"],
-                    ),
-                )
-
-            rows = conn.execute(
-                """
-                SELECT * FROM daily_missions
-                WHERE guild_id=? AND mission_date=?
-                ORDER BY slot
-                """,
-                (guild_id, mission_date),
-            ).fetchall()
-            return [dict(r) for r in rows]
-
-    async def ensure_daily_missions(
-        self,
-        guild_id: int,
-        mission_date: str,
-        reroll: bool = False,
-    ) -> list[dict[str, Any]]:
-        return await self.run(
-            self._ensure_daily_missions,
-            guild_id,
-            mission_date,
-            reroll,
-        )
-
-    def _get_daily_missions(
-        self,
-        guild_id: int,
-        mission_date: str,
-    ) -> list[dict[str, Any]]:
+    def _settings_export(self, guild_id: int):
         with self.connect() as conn:
-            return [
-                dict(r)
+            settings = {
+                r["key"]: r["value"]
                 for r in conn.execute(
-                    """
-                    SELECT * FROM daily_missions
-                    WHERE guild_id=? AND mission_date=?
-                    ORDER BY slot
-                    """,
-                    (guild_id, mission_date),
-                ).fetchall()
-            ]
-
-    async def get_daily_missions(
-        self,
-        guild_id: int,
-        mission_date: str,
-    ) -> list[dict[str, Any]]:
-        return await self.run(
-            self._get_daily_missions,
-            guild_id,
-            mission_date,
-        )
-
-    def _increment_mission_progress(
-        self,
-        guild_id: int,
-        mission_date: str,
-        user_id: int,
-        mission: dict[str, Any],
-        increment_seconds: int,
-    ) -> tuple[int, bool]:
-        target_seconds = int(mission["target"]) * 60
-        now = to_iso()
-
-        with self.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT progress_seconds, completed_at
-                FROM mission_progress
-                WHERE guild_id=? AND mission_date=?
-                  AND user_id=? AND mission_code=?
-                """,
-                (
-                    guild_id,
-                    mission_date,
-                    user_id,
-                    mission["mission_code"],
-                ),
-            ).fetchone()
-
-            previous = int(row["progress_seconds"] or 0) if row else 0
-            already_completed = bool(row and row["completed_at"])
-
-            if already_completed:
-                return previous, False
-
-            new_progress = min(target_seconds, previous + increment_seconds)
-            completed_now = new_progress >= target_seconds
-
-            conn.execute(
-                """
-                INSERT INTO mission_progress (
-                    guild_id, mission_date, user_id, mission_code,
-                    progress_seconds, completed_at
+                    "SELECT key,value FROM settings WHERE guild_id=?",
+                    (guild_id,),
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(
-                    guild_id, mission_date, user_id, mission_code
-                ) DO UPDATE SET
-                    progress_seconds=excluded.progress_seconds,
-                    completed_at=COALESCE(
-                        mission_progress.completed_at,
-                        excluded.completed_at
-                    )
-                """,
-                (
-                    guild_id,
-                    mission_date,
-                    user_id,
-                    mission["mission_code"],
-                    new_progress,
-                    now if completed_now else None,
-                ),
-            )
-
-            if completed_now:
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO reward_queue (
-                        guild_id, mission_date, user_id, mission_code,
-                        mission_name, points, status, created_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
-                    """,
-                    (
-                        guild_id,
-                        mission_date,
-                        user_id,
-                        mission["mission_code"],
-                        mission["name"],
-                        mission["reward"],
-                        now,
-                    ),
-                )
-
-            return new_progress, completed_now
-
-    async def increment_mission_progress(
-        self,
-        guild_id: int,
-        mission_date: str,
-        user_id: int,
-        mission: dict[str, Any],
-        increment_seconds: int,
-    ) -> tuple[int, bool]:
-        return await self.run(
-            self._increment_mission_progress,
-            guild_id,
-            mission_date,
-            user_id,
-            mission,
-            increment_seconds,
-        )
-
-    def _get_user_mission_progress(
-        self,
-        guild_id: int,
-        mission_date: str,
-        user_id: int,
-    ) -> list[dict[str, Any]]:
-        with self.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT
-                    m.*,
-                    COALESCE(p.progress_seconds, 0) AS progress_seconds,
-                    p.completed_at
-                FROM daily_missions m
-                LEFT JOIN mission_progress p
-                  ON p.guild_id=m.guild_id
-                 AND p.mission_date=m.mission_date
-                 AND p.mission_code=m.mission_code
-                 AND p.user_id=?
-                WHERE m.guild_id=? AND m.mission_date=?
-                ORDER BY m.slot
-                """,
-                (user_id, guild_id, mission_date),
-            ).fetchall()
-            return [dict(r) for r in rows]
-
-    async def get_user_mission_progress(
-        self,
-        guild_id: int,
-        mission_date: str,
-        user_id: int,
-    ) -> list[dict[str, Any]]:
-        return await self.run(
-            self._get_user_mission_progress,
-            guild_id,
-            mission_date,
-            user_id,
-        )
-
-    def _pending_rewards(
-        self,
-        guild_id: int,
-        limit: int = 100,
-    ) -> list[dict[str, Any]]:
-        with self.connect() as conn:
-            return [
-                dict(r)
+            }
+            categories = [
+                int(r["category_id"])
                 for r in conn.execute(
-                    """
-                    SELECT * FROM reward_queue
-                    WHERE guild_id=? AND status='pending'
-                    ORDER BY created_at ASC
-                    LIMIT ?
-                    """,
-                    (guild_id, limit),
-                ).fetchall()
+                    "SELECT category_id FROM holiday_categories WHERE guild_id=?",
+                    (guild_id,),
+                )
             ]
+            return {"guild_id": guild_id, "settings": settings, "holiday_categories": categories}
 
-    async def pending_rewards(
+    async def settings_export(self, guild_id: int):
+        return await self.run(self._settings_export, guild_id)
+
+
+    def _mission_create(
         self,
         guild_id: int,
-        limit: int = 100,
-    ) -> list[dict[str, Any]]:
-        return await self.run(
-            self._pending_rewards,
-            guild_id,
-            limit,
-        )
-
-    def _complete_reward(
-        self,
-        guild_id: int,
-        reward_id: int,
-        completed_by: int,
-    ) -> bool:
+        name: str,
+        description: str,
+        mission_type: str,
+        target_value: int,
+        reward_points: int,
+        created_by: int,
+    ):
         with self.connect() as conn:
             cur = conn.execute(
                 """
-                UPDATE reward_queue
-                SET status='completed',
-                    completed_at=?,
-                    completed_by=?
-                WHERE guild_id=? AND id=? AND status='pending'
+                INSERT INTO missions(
+                    guild_id,name,description,mission_type,target_value,
+                    reward_points,is_active,created_by,created_at
+                ) VALUES(?,?,?,?,?,?,1,?,?)
                 """,
-                (to_iso(), completed_by, guild_id, reward_id),
+                (
+                    guild_id,
+                    name,
+                    description,
+                    mission_type,
+                    target_value,
+                    reward_points,
+                    created_by,
+                    to_iso(),
+                ),
+            )
+            return int(cur.lastrowid)
+
+    async def mission_create(self, *args):
+        return await self.run(self._mission_create, *args)
+
+    def _mission_list(self, guild_id: int, active_only: bool = False):
+        with self.connect() as conn:
+            sql = "SELECT * FROM missions WHERE guild_id=?"
+            params: list[Any] = [guild_id]
+            if active_only:
+                sql += " AND is_active=1"
+            sql += " ORDER BY id"
+            return [dict(r) for r in conn.execute(sql, params)]
+
+    async def mission_list(self, guild_id: int, active_only: bool = False):
+        return await self.run(self._mission_list, guild_id, active_only)
+
+    def _mission_set_active(self, guild_id: int, mission_id: int, active: bool):
+        with self.connect() as conn:
+            cur = conn.execute(
+                "UPDATE missions SET is_active=? WHERE guild_id=? AND id=?",
+                (1 if active else 0, guild_id, mission_id),
             )
             return cur.rowcount > 0
 
-    async def complete_reward(
-        self,
-        guild_id: int,
-        reward_id: int,
-        completed_by: int,
-    ) -> bool:
-        return await self.run(
-            self._complete_reward,
-            guild_id,
-            reward_id,
-            completed_by,
-        )
+    async def mission_set_active(self, *args):
+        return await self.run(self._mission_set_active, *args)
 
-    def _complete_all_rewards(
+    def _mission_delete(self, guild_id: int, mission_id: int):
+        with self.connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM missions WHERE guild_id=? AND id=?",
+                (guild_id, mission_id),
+            )
+            return cur.rowcount > 0
+
+    async def mission_delete(self, *args):
+        return await self.run(self._mission_delete, *args)
+
+    def _mission_ensure_defaults(self, guild_id: int):
+        with self.connect() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) c FROM missions WHERE guild_id=?",
+                (guild_id,),
+            ).fetchone()["c"]
+            if count:
+                return
+            defaults = [
+                ("VCに30分滞在", "合計30分VCに参加する", "voice_minutes", 30, 100),
+                ("VCに1回参加", "VCへ1回入室する", "voice_join", 1, 30),
+                ("チャットを10回", "テキストチャンネルで10回発言する", "messages", 10, 50),
+            ]
+            for name, desc, mtype, target, reward in defaults:
+                conn.execute(
+                    """
+                    INSERT INTO missions(
+                        guild_id,name,description,mission_type,target_value,
+                        reward_points,is_active,created_by,created_at
+                    ) VALUES(?,?,?,?,?,?,1,NULL,?)
+                    """,
+                    (guild_id, name, desc, mtype, target, reward, to_iso()),
+                )
+
+    async def mission_ensure_defaults(self, guild_id: int):
+        await self.run(self._mission_ensure_defaults, guild_id)
+
+    def _mission_day_get(self, guild_id: int, mission_date: str):
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM mission_days WHERE guild_id=? AND mission_date=?",
+                (guild_id, mission_date),
+            ).fetchone()
+            return dict(row) if row else None
+
+    async def mission_day_get(self, guild_id: int, mission_date: str):
+        return await self.run(self._mission_day_get, guild_id, mission_date)
+
+    def _mission_day_upsert(
         self,
         guild_id: int,
-        completed_by: int,
-    ) -> int:
+        mission_date: str,
+        channel_id: int,
+        message_id: int,
+    ):
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO mission_days(
+                    guild_id,mission_date,message_id,channel_id,created_at
+                ) VALUES(?,?,?,?,?)
+                ON CONFLICT(guild_id,mission_date) DO UPDATE SET
+                    message_id=excluded.message_id,
+                    channel_id=excluded.channel_id
+                """,
+                (guild_id, mission_date, message_id, channel_id, to_iso()),
+            )
+
+    async def mission_day_upsert(self, *args):
+        await self.run(self._mission_day_upsert, *args)
+
+    def _mission_day_close(self, guild_id: int, mission_date: str):
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE mission_days SET closed_at=?
+                WHERE guild_id=? AND mission_date=? AND closed_at IS NULL
+                """,
+                (to_iso(), guild_id, mission_date),
+            )
+
+    async def mission_day_close(self, *args):
+        await self.run(self._mission_day_close, *args)
+
+    def _mission_add_progress(
+        self,
+        guild_id: int,
+        mission_date: str,
+        user_id: int,
+        mission_type: str,
+        amount: int,
+    ):
+        with self.connect() as conn:
+            missions = conn.execute(
+                """
+                SELECT * FROM missions
+                WHERE guild_id=? AND is_active=1 AND mission_type=?
+                """,
+                (guild_id, mission_type),
+            ).fetchall()
+            completed_ids = []
+            for mission in missions:
+                row = conn.execute(
+                    """
+                    SELECT progress_value,completed_at
+                    FROM mission_progress
+                    WHERE guild_id=? AND mission_date=? AND mission_id=? AND user_id=?
+                    """,
+                    (guild_id, mission_date, mission["id"], user_id),
+                ).fetchone()
+                old = int(row["progress_value"]) if row else 0
+                completed_at = row["completed_at"] if row else None
+                new_value = old + amount
+                if not completed_at and new_value >= int(mission["target_value"]):
+                    completed_at = to_iso()
+                    completed_ids.append(int(mission["id"]))
+                conn.execute(
+                    """
+                    INSERT INTO mission_progress(
+                        guild_id,mission_date,mission_id,user_id,
+                        progress_value,completed_at,reward_status
+                    ) VALUES(?,?,?,?,?,?,'pending')
+                    ON CONFLICT(guild_id,mission_date,mission_id,user_id)
+                    DO UPDATE SET
+                        progress_value=excluded.progress_value,
+                        completed_at=COALESCE(mission_progress.completed_at,excluded.completed_at)
+                    """,
+                    (
+                        guild_id,
+                        mission_date,
+                        mission["id"],
+                        user_id,
+                        new_value,
+                        completed_at,
+                    ),
+                )
+            return completed_ids
+
+    async def mission_add_progress(self, *args):
+        return await self.run(self._mission_add_progress, *args)
+
+    def _mission_manual_complete(
+        self,
+        guild_id: int,
+        mission_date: str,
+        mission_id: int,
+        user_id: int,
+    ):
+        with self.connect() as conn:
+            mission = conn.execute(
+                "SELECT target_value FROM missions WHERE guild_id=? AND id=?",
+                (guild_id, mission_id),
+            ).fetchone()
+            if not mission:
+                return False
+            conn.execute(
+                """
+                INSERT INTO mission_progress(
+                    guild_id,mission_date,mission_id,user_id,
+                    progress_value,completed_at,reward_status
+                ) VALUES(?,?,?,?,?,?,'pending')
+                ON CONFLICT(guild_id,mission_date,mission_id,user_id)
+                DO UPDATE SET
+                    progress_value=excluded.progress_value,
+                    completed_at=COALESCE(mission_progress.completed_at,excluded.completed_at)
+                """,
+                (
+                    guild_id,
+                    mission_date,
+                    mission_id,
+                    user_id,
+                    int(mission["target_value"]),
+                    to_iso(),
+                ),
+            )
+            return True
+
+    async def mission_manual_complete(self, *args):
+        return await self.run(self._mission_manual_complete, *args)
+
+    def _mission_completed(self, guild_id: int, mission_date: str):
+        with self.connect() as conn:
+            return [
+                dict(r)
+                for r in conn.execute(
+                    """
+                    SELECT p.*,m.name,m.reward_points,m.target_value
+                    FROM mission_progress p
+                    JOIN missions m ON m.id=p.mission_id
+                    WHERE p.guild_id=? AND p.mission_date=?
+                      AND p.completed_at IS NOT NULL
+                    ORDER BY p.completed_at
+                    """,
+                    (guild_id, mission_date),
+                )
+            ]
+
+    async def mission_completed(self, guild_id: int, mission_date: str):
+        return await self.run(self._mission_completed, guild_id, mission_date)
+
+    def _mission_pending_rewards(self, guild_id: int, mission_date: Optional[str] = None):
+        with self.connect() as conn:
+            sql = """
+                SELECT p.*,m.name,m.reward_points
+                FROM mission_progress p
+                JOIN missions m ON m.id=p.mission_id
+                WHERE p.guild_id=? AND p.completed_at IS NOT NULL
+                  AND p.reward_status='pending'
+            """
+            params: list[Any] = [guild_id]
+            if mission_date:
+                sql += " AND p.mission_date=?"
+                params.append(mission_date)
+            sql += " ORDER BY p.mission_date,p.user_id,p.mission_id"
+            return [dict(r) for r in conn.execute(sql, params)]
+
+    async def mission_pending_rewards(self, guild_id: int, mission_date: Optional[str] = None):
+        return await self.run(self._mission_pending_rewards, guild_id, mission_date)
+
+    def _mission_mark_rewarded(
+        self,
+        guild_id: int,
+        mission_date: str,
+        mission_id: int,
+        user_id: int,
+        moderator_id: int,
+    ):
         with self.connect() as conn:
             cur = conn.execute(
                 """
-                UPDATE reward_queue
-                SET status='completed',
-                    completed_at=?,
-                    completed_by=?
-                WHERE guild_id=? AND status='pending'
+                UPDATE mission_progress
+                SET reward_status='rewarded',rewarded_at=?,rewarded_by=?
+                WHERE guild_id=? AND mission_date=? AND mission_id=? AND user_id=?
+                  AND completed_at IS NOT NULL
                 """,
-                (to_iso(), completed_by, guild_id),
+                (
+                    to_iso(),
+                    moderator_id,
+                    guild_id,
+                    mission_date,
+                    mission_id,
+                    user_id,
+                ),
             )
-            return int(cur.rowcount)
+            return cur.rowcount > 0
 
-    async def complete_all_rewards(
+    async def mission_mark_rewarded(self, *args):
+        return await self.run(self._mission_mark_rewarded, *args)
+
+    def _mission_mark_all_rewarded(
         self,
         guild_id: int,
-        completed_by: int,
-    ) -> int:
-        return await self.run(
-            self._complete_all_rewards,
-            guild_id,
-            completed_by,
-        )
+        mission_date: str,
+        moderator_id: int,
+    ):
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE mission_progress
+                SET reward_status='rewarded',rewarded_at=?,rewarded_by=?
+                WHERE guild_id=? AND mission_date=?
+                  AND completed_at IS NOT NULL AND reward_status='pending'
+                """,
+                (to_iso(), moderator_id, guild_id, mission_date),
+            )
+            return cur.rowcount
+
+    async def mission_mark_all_rewarded(self, *args):
+        return await self.run(self._mission_mark_all_rewarded, *args)
 
 db = Database(DB_PATH)
+db.initialize()
 
 # =========================================================
-# Bot
+# Bot / 権限
 # =========================================================
 
-intents = discord.Intents.none()
-intents.guilds = True
+intents = discord.Intents.default()
 intents.members = True
 intents.voice_states = True
+intents.message_content = True
 intents.moderation = True
 
-bot = commands.Bot(
-    command_prefix=commands.when_mentioned,
-    intents=intents,
-    help_command=None,
-)
+class ManagementBot(commands.Bot):
+    def __init__(self):
+        super().__init__(
+            command_prefix=commands.when_mentioned,
+            intents=intents,
+            help_command=None,
+        )
+        self.synced = False
+
+    async def setup_hook(self):
+        self.add_view(ManagementPanelView())
+        holiday_scheduler.start()
+        dashboard_updater.start()
+        mission_scheduler.start()
+
+bot = ManagementBot()
+
 
 def target_guild() -> discord.Object:
     return discord.Object(id=GUILD_ID)
 
-def is_excluded_channel(channel: Optional[discord.abc.GuildChannel]) -> bool:
-    if channel is None:
-        return False
-    category_id = getattr(channel, "category_id", None)
-    return bool(category_id and category_id in EXCLUDED_VOICE_CATEGORY_IDS)
-
-def should_track_member(member: discord.Member) -> bool:
-    return not member.bot and member.id not in EXCLUDED_USER_IDS
-
-def active_voice_members(guild: discord.Guild) -> list[discord.Member]:
-    result: list[discord.Member] = []
-    for channel in guild.voice_channels:
-        if is_excluded_channel(channel):
-            continue
-        for member in channel.members:
-            if should_track_member(member):
-                result.append(member)
-    for channel in guild.stage_channels:
-        if is_excluded_channel(channel):
-            continue
-        for member in channel.members:
-            if should_track_member(member):
-                result.append(member)
-    return result
-
-
-def eligible_member_count(guild: discord.Guild) -> int:
-    """Botと除外ユーザーを除いた現在の人間メンバー数。"""
-    return sum(
-        1
-        for member in guild.members
-        if should_track_member(member)
-    )
-
-
-def participation_rank(rate: float) -> tuple[str, str]:
-    if rate >= 50:
-        return "👑", "LEGEND"
-    if rate >= 40:
-        return "💎", "DIAMOND"
-    if rate >= 30:
-        return "🥇", "GOLD"
-    if rate >= 20:
-        return "🥈", "SILVER"
-    if rate >= 10:
-        return "🥉", "BRONZE"
-    return "🌱", "START"
-
-
-def add_participation_data(
-    stats: dict[str, Any],
-    guild: discord.Guild,
-) -> dict[str, Any]:
-    total = eligible_member_count(guild)
-    rate = (
-        stats["unique_users"] / total * 100
-        if total > 0
-        else 0.0
-    )
-    icon, rank = participation_rank(rate)
-
-    result = dict(stats)
-    result["eligible_members"] = total
-    result["overall_participation_rate"] = rate
-    result["participation_rank_icon"] = icon
-    result["participation_rank"] = rank
-    return result
-
-
-async def average_daily_participation(
-    guild: discord.Guild,
-    days: int,
-) -> tuple[float, float]:
-    """直近N日の日別平均参加率と最高参加率。"""
-    total = eligible_member_count(guild)
-    if total <= 0:
-        return 0.0, 0.0
-
-    rates: list[float] = []
-    for days_ago in range(days):
-        start, end = local_day_bounds(days_ago)
-        if days_ago == 0:
-            end = utcnow()
-
-        daily = await db.stats(guild.id, start, end)
-        rates.append(daily["unique_users"] / total * 100)
-
-    return (
-        sum(rates) / len(rates) if rates else 0.0,
-        max(rates) if rates else 0.0,
-    )
 
 async def is_manager(interaction: discord.Interaction) -> bool:
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
         return False
     if interaction.user.guild_permissions.administrator:
         return True
-    return any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles)
+
+    configured = await db.get_setting(
+        interaction.guild.id,
+        "admin_role_id",
+        str(ADMIN_ROLE_ID),
+    )
+    try:
+        role_id = int(configured or 0)
+    except ValueError:
+        role_id = ADMIN_ROLE_ID
+    return any(role.id == role_id for role in interaction.user.roles)
+
 
 def manager_only():
-    async def predicate(interaction: discord.Interaction) -> bool:
+    async def predicate(interaction: discord.Interaction):
         if not await is_manager(interaction):
             raise app_commands.CheckFailure("このコマンドは運営専用です。")
         return True
     return app_commands.check(predicate)
 
+
 async def private_reply(
     interaction: discord.Interaction,
-    *,
     content: Optional[str] = None,
     embed: Optional[discord.Embed] = None,
     file: Optional[discord.File] = None,
-) -> None:
+    view: Optional[discord.ui.View] = None,
+):
     kwargs: dict[str, Any] = {"ephemeral": True}
     if content is not None:
         kwargs["content"] = content
@@ -1493,1607 +1082,1578 @@ async def private_reply(
         kwargs["embed"] = embed
     if file is not None:
         kwargs["file"] = file
+    if view is not None:
+        kwargs["view"] = view
 
     if interaction.response.is_done():
         await interaction.followup.send(**kwargs)
     else:
         await interaction.response.send_message(**kwargs)
 
-async def send_log(
+
+async def get_setting_channel(
     guild: discord.Guild,
-    *,
-    title: str,
-    description: str,
-    color: discord.Color = EMBED_COLOR,
-    join_leave: bool = False,
-) -> None:
-    channel_id = JOIN_LEAVE_LOG_CHANNEL_ID if join_leave else MANAGEMENT_LOG_CHANNEL_ID
-    channel = guild.get_channel(channel_id)
-    if not isinstance(channel, discord.TextChannel):
-        return
-    embed = discord.Embed(
-        title=title,
-        description=description,
-        color=color,
-        timestamp=utcnow(),
-    )
-    try:
-        await channel.send(embed=embed)
-    except discord.HTTPException:
-        log.exception("管理ログ送信に失敗しました")
-
-async def ensure_member_record(member: discord.Member) -> None:
-    await db.upsert_member(member)
-
-async def get_recent_removal_action(
-    guild: discord.Guild,
-    user_id: int,
-) -> tuple[str, Optional[int], Optional[str]]:
-    await asyncio.sleep(1.5)
-    now = utcnow()
-    checks = (
-        (discord.AuditLogAction.kick, "kick"),
-        (discord.AuditLogAction.ban, "ban"),
-    )
-    for action, label in checks:
-        try:
-            async for entry in guild.audit_logs(limit=8, action=action):
-                if (now - entry.created_at).total_seconds() > 15:
-                    continue
-                if getattr(entry.target, "id", None) == user_id:
-                    return label, getattr(entry.user, "id", None), entry.reason
-        except discord.Forbidden:
-            return "leave", None, "監査ログ権限なし"
-        except discord.HTTPException:
-            log.exception("監査ログ取得に失敗しました")
-            break
-    return "leave", None, None
-
-
-# =========================================================
-# 放課後ミッション補助
-# =========================================================
-
-def mission_date_key() -> str:
-    return local_now().strftime("%Y-%m-%d")
-
-def difficulty_emoji(value: str) -> str:
-    return {
-        "EASY": "🟢",
-        "NORMAL": "🔵",
-        "HARD": "🟣",
-        "RARE": "🌈",
-    }.get(value, "🎯")
-
-async def get_mission_channel(
-    guild: discord.Guild,
+    key: str,
+    fallback_id: int = 0,
 ) -> Optional[discord.TextChannel]:
-    channel_id = await db.get_setting(guild.id, "mission_channel_id")
-    if not channel_id:
+    value = await db.get_setting(guild.id, key, str(fallback_id))
+    try:
+        channel_id = int(value or 0)
+    except ValueError:
         return None
-    channel = guild.get_channel(int(channel_id))
+    channel = guild.get_channel(channel_id)
     return channel if isinstance(channel, discord.TextChannel) else None
 
-def mission_board_embed(
-    missions: list[dict[str, Any]],
-    date_key: str,
-) -> discord.Embed:
+
+async def send_log(
+    guild: discord.Guild,
+    embed: discord.Embed,
+    join_leave: bool = False,
+):
+    key = "join_leave_log_channel_id" if join_leave else "management_log_channel_id"
+    fallback = JOIN_LEAVE_LOG_CHANNEL_ID if join_leave else MANAGEMENT_LOG_CHANNEL_ID
+    channel = await get_setting_channel(guild, key, fallback)
+    if channel:
+        try:
+            await channel.send(embed=embed)
+        except discord.HTTPException:
+            log.exception("ログ送信失敗")
+
+
+def audit_reason(reason: Optional[str], actor: discord.abc.User) -> str:
+    return f"{reason or '理由なし'} / 実行者: {actor} ({actor.id})"
+
+
+# =========================================================
+# Holidayシステム
+# =========================================================
+
+def bool_to_db(value: Optional[bool]) -> Optional[int]:
+    return None if value is None else int(value)
+
+
+def db_to_bool(value: Optional[int]) -> Optional[bool]:
+    return None if value is None else bool(value)
+
+
+async def selected_holiday_channels(guild: discord.Guild):
+    category_ids = await db.holiday_categories(guild.id)
+    channels: list[discord.abc.GuildChannel] = []
+    for category_id in category_ids:
+        category = guild.get_channel(category_id)
+        if isinstance(category, discord.CategoryChannel):
+            channels.extend(category.channels)
+    return channels
+
+
+async def apply_holiday(guild: discord.Guild, actor: Optional[discord.abc.User] = None):
+    active = await db.get_setting(guild.id, "holiday_active", "0")
+    if active == "1":
+        return False, "すでにお休みモードです。"
+
+    channels = await selected_holiday_channels(guild)
+    if not channels:
+        return False, "対象カテゴリーが登録されていません。"
+
+    await db.clear_permission_backups(guild.id)
+    everyone = guild.default_role
+
+    changed = 0
+    for channel in channels:
+        overwrite = channel.overwrites_for(everyone)
+        await db.save_permission_backup(
+            guild.id,
+            channel.id,
+            everyone.id,
+            "role",
+            overwrite,
+        )
+
+        new_overwrite = channel.overwrites_for(everyone)
+
+        if isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+            # VCは表示を残し、接続と発言を不可にする
+            new_overwrite.connect = False
+            new_overwrite.speak = False
+        elif isinstance(channel, (discord.TextChannel, discord.ForumChannel)):
+            # テキストは閲覧を残し、投稿のみ不可にする
+            new_overwrite.send_messages = False
+            new_overwrite.add_reactions = False
+            new_overwrite.create_public_threads = False
+            new_overwrite.send_messages_in_threads = False
+        else:
+            continue
+
+        try:
+            await channel.set_permissions(
+                everyone,
+                overwrite=new_overwrite,
+                reason="Holidayお休みモード開始",
+            )
+            changed += 1
+        except discord.Forbidden:
+            log.warning("権限変更不可: %s", channel)
+        except discord.HTTPException:
+            log.exception("権限変更失敗: %s", channel)
+
+    await db.set_setting(guild.id, "holiday_active", "1")
+    await db.set_setting(guild.id, "holiday_started_at", to_iso())
+    await announce_holiday(guild, True)
+
     embed = discord.Embed(
-        title="🏫 今日の放課後ミッション",
-        description=(
-            f"**{date_key}**\n"
-            "VCで遊びながら達成しよう！\n"
-            "報酬は管理者確認後、天真爛漫Botで付与されます。"
-        ),
-        color=EMBED_COLOR,
+        title="🌙 Holidayモード開始",
+        description=f"対象カテゴリー内の **{changed}チャンネル** を休止しました。",
+        color=discord.Color.dark_purple(),
         timestamp=utcnow(),
     )
-    for mission in missions:
-        embed.add_field(
-            name=(
-                f"{difficulty_emoji(mission['difficulty'])} "
-                f"{mission['difficulty']}｜{mission['name']}"
-            ),
-            value=(
-                f"{mission['description']}\n"
-                f"報酬予定：**{mission['reward']}pt**"
-            ),
-            inline=False,
-        )
-    embed.set_footer(
-        text="進捗確認：/ミッション進捗"
-    )
-    return embed
+    if actor:
+        embed.set_footer(text=f"実行者: {actor}")
+    await send_log(guild, embed)
+    return True, f"{changed}チャンネルを休止しました。"
 
-async def post_daily_missions(
-    guild: discord.Guild,
-    *,
-    reroll: bool = False,
-) -> bool:
-    date_key = mission_date_key()
-    missions = await db.ensure_daily_missions(
-        guild.id,
-        date_key,
-        reroll,
-    )
-    channel = await get_mission_channel(guild)
-    if not channel:
-        return False
 
-    try:
-        await channel.send(
-            embed=mission_board_embed(missions, date_key)
-        )
-        return True
-    except discord.HTTPException:
-        log.exception("ミッション掲示に失敗しました")
-        return False
+async def restore_holiday(guild: discord.Guild, actor: Optional[discord.abc.User] = None):
+    active = await db.get_setting(guild.id, "holiday_active", "0")
+    backups = await db.permission_backups(guild.id)
 
-async def announce_mission_complete(
-    guild: discord.Guild,
-    member: discord.Member,
-    mission: dict[str, Any],
-) -> None:
-    channel = await get_mission_channel(guild)
-    if not channel:
-        channel = guild.get_channel(MANAGEMENT_LOG_CHANNEL_ID)
-    if not isinstance(channel, discord.TextChannel):
-        return
+    if active != "1" and not backups:
+        return False, "現在お休みモードではありません。"
+
+    restored = 0
+    for row in backups:
+        channel = guild.get_channel(int(row["channel_id"]))
+        if not channel:
+            continue
+
+        target = guild.get_role(int(row["target_id"]))
+        if not target:
+            continue
+
+        overwrite = channel.overwrites_for(target)
+        overwrite.view_channel = db_to_bool(row["view_channel"])
+        overwrite.connect = db_to_bool(row["connect"])
+        overwrite.send_messages = db_to_bool(row["send_messages"])
+        overwrite.speak = db_to_bool(row["speak"])
+        overwrite.add_reactions = db_to_bool(row["add_reactions"])
+        overwrite.create_public_threads = db_to_bool(row["create_public_threads"])
+        overwrite.send_messages_in_threads = db_to_bool(row["send_messages_in_threads"])
+
+        try:
+            if overwrite.is_empty():
+                await channel.set_permissions(
+                    target,
+                    overwrite=None,
+                    reason="Holidayモード終了・権限復元",
+                )
+            else:
+                await channel.set_permissions(
+                    target,
+                    overwrite=overwrite,
+                    reason="Holidayモード終了・権限復元",
+                )
+            restored += 1
+        except discord.Forbidden:
+            log.warning("復元権限不足: %s", channel)
+        except discord.HTTPException:
+            log.exception("権限復元失敗: %s", channel)
+
+    await db.clear_permission_backups(guild.id)
+    await db.set_setting(guild.id, "holiday_active", "0")
+    await announce_holiday(guild, False)
 
     embed = discord.Embed(
-        title="🎉 Mission Complete!",
-        description=(
-            f"{member.mention} がミッションを達成しました！\n\n"
-            f"**{mission['name']}**\n"
-            f"{mission['description']}\n\n"
-            f"💰 報酬予定：**{mission['reward']}pt**\n"
-            "※管理者確認後にポイントが付与されます。"
-        ),
+        title="🌸 Holidayモード終了",
+        description=f"**{restored}チャンネル** の権限を休止前へ戻しました。",
         color=discord.Color.green(),
         timestamp=utcnow(),
     )
+    if actor:
+        embed.set_footer(text=f"実行者: {actor}")
+    await send_log(guild, embed)
+    return True, f"{restored}チャンネルを復元しました。"
+
+
+async def announce_holiday(guild: discord.Guild, closing: bool):
+    channel = await get_setting_channel(guild, "holiday_notice_channel_id")
+    if not channel:
+        return
+
+    if closing:
+        embed = discord.Embed(
+            title="🌙 土日はお休みDAYです",
+            description=(
+                "対象カテゴリーのVC・テキストをお休みにしました。\n"
+                "月曜日0:00に自動で再開します。"
+            ),
+            color=discord.Color.dark_purple(),
+            timestamp=utcnow(),
+        )
+    else:
+        embed = discord.Embed(
+            title="🌸 お休みDAY終了",
+            description="対象カテゴリーを再開しました。皆さんお待たせしました！",
+            color=discord.Color.green(),
+            timestamp=utcnow(),
+        )
     try:
         await channel.send(embed=embed)
-    except discord.HTTPException:
-        log.exception("ミッション達成通知に失敗しました")
-
-# =========================================================
-# Events
-# =========================================================
-
-@bot.event
-async def setup_hook() -> None:
-    db.initialize()
-    synced = await bot.tree.sync(guild=target_guild())
-    log.info("Synced %d guild commands", len(synced))
-
-@bot.event
-async def on_ready() -> None:
-    log.info("Logged in as %s (%s)", bot.user, bot.user.id if bot.user else "?")
-    guild = bot.get_guild(GUILD_ID)
-    if guild:
-        for member in guild.members:
-            if not member.bot:
-                await ensure_member_record(member)
-        for member in active_voice_members(guild):
-            if member.voice and member.voice.channel:
-                await db.start_voice_session(member, member.voice.channel)
-        await db.record_concurrency(guild.id, len(active_voice_members(guild)))
-
-    if not dashboard_loop.is_running():
-        dashboard_loop.start()
-    if not daily_summary_loop.is_running():
-        daily_summary_loop.start()
-    if not mission_progress_loop.is_running():
-        mission_progress_loop.start()
-    if not mission_daily_post_loop.is_running():
-        mission_daily_post_loop.start()
-
-@bot.event
-async def on_member_join(member: discord.Member) -> None:
-    if member.guild.id != GUILD_ID or member.bot:
-        return
-    await db.upsert_member(member)
-    await db.add_member_event(member.guild.id, member.id, "join")
-    await send_log(
-        member.guild,
-        title="📥 メンバー加入",
-        description=(
-            f"{member.mention}（`{member.id}`）\n"
-            f"アカウント作成: {fmt_dt(member.created_at, 'R')}\n"
-            f"加入: {fmt_dt(utcnow())}"
-        ),
-        color=discord.Color.green(),
-        join_leave=True,
-    )
-
-@bot.event
-async def on_raw_member_remove(payload: discord.RawMemberRemoveEvent) -> None:
-    if payload.guild_id != GUILD_ID or payload.user.bot:
-        return
-
-    guild = bot.get_guild(payload.guild_id)
-    if not guild:
-        return
-
-    await db.mark_left(guild.id, payload.user.id)
-    action, actor_id, reason = await get_recent_removal_action(guild, payload.user.id)
-    await db.add_member_event(guild.id, payload.user.id, action, actor_id, reason)
-
-    labels = {
-        "leave": ("📤 メンバー退出", discord.Color.orange()),
-        "kick": ("🥾 メンバーKick", discord.Color.red()),
-        "ban": ("🔨 メンバーBAN", discord.Color.dark_red()),
-    }
-    title, color = labels[action]
-    actor = f"<@{actor_id}>" if actor_id else "不明 / 自主退出"
-    await send_log(
-        guild,
-        title=title,
-        description=(
-            f"{payload.user.mention}（`{payload.user.id}`）\n"
-            f"種別: **{action.upper()}**\n"
-            f"実行者: {actor}\n"
-            f"理由: {safe_text(reason)}"
-        ),
-        color=color,
-        join_leave=True,
-    )
-
-@bot.event
-async def on_member_unban(guild: discord.Guild, user: discord.User) -> None:
-    if guild.id != GUILD_ID:
-        return
-    actor_id = None
-    reason = None
-    await asyncio.sleep(1)
-    try:
-        async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.unban):
-            if getattr(entry.target, "id", None) == user.id:
-                actor_id = getattr(entry.user, "id", None)
-                reason = entry.reason
-                break
     except discord.HTTPException:
         pass
 
-    await db.add_member_event(guild.id, user.id, "unban", actor_id, reason)
-    await send_log(
-        guild,
-        title="🔓 BAN解除",
+
+@tasks.loop(seconds=HOLIDAY_CHECK_SECONDS)
+async def holiday_scheduler():
+    now = local_now()
+    # weekday: 月0〜日6
+    for guild in bot.guilds:
+        auto = await db.get_setting(guild.id, "holiday_auto", "0")
+        if auto != "1":
+            continue
+
+        active = await db.get_setting(guild.id, "holiday_active", "0")
+        weekend = now.weekday() in (5, 6)
+
+        if weekend and active != "1":
+            await apply_holiday(guild)
+        elif not weekend and active == "1":
+            await restore_holiday(guild)
+
+
+@holiday_scheduler.before_loop
+async def before_holiday_scheduler():
+    await bot.wait_until_ready()
+
+
+# =========================================================
+# Daily Mission System
+# =========================================================
+
+def mission_date_jst() -> str:
+    return local_now().date().isoformat()
+
+
+def mission_type_label(mission_type: str) -> str:
+    return {
+        "voice_minutes": "🎙 VC滞在",
+        "voice_join": "🚪 VC参加",
+        "messages": "💬 チャット",
+        "manual": "📝 手動判定",
+    }.get(mission_type, mission_type)
+
+
+async def build_mission_embed(guild: discord.Guild, mission_date: str):
+    missions = await db.mission_list(guild.id, active_only=True)
+    completed = await db.mission_completed(guild.id, mission_date)
+
+    completed_by_mission: dict[int, list[int]] = {}
+    for row in completed:
+        completed_by_mission.setdefault(int(row["mission_id"]), []).append(int(row["user_id"]))
+
+    embed = discord.Embed(
+        title=f"🎯 デイリーミッション｜{mission_date}",
         description=(
-            f"{user.mention}（`{user.id}`）\n"
-            f"実行者: {f'<@{actor_id}>' if actor_id else '不明'}\n"
-            f"理由: {safe_text(reason)}"
+            "毎日0:00に更新されます。\n"
+            "報酬ポイントは管理者が確認後、**天真爛漫Bot**で付与します。"
         ),
-        color=discord.Color.green(),
-        join_leave=True,
+        color=discord.Color.from_rgb(255, 186, 73),
+        timestamp=utcnow(),
     )
+
+    if not missions:
+        embed.add_field(name="ミッション未設定", value="管理者がミッションを追加してください。", inline=False)
+    else:
+        for mission in missions:
+            done_ids = completed_by_mission.get(int(mission["id"]), [])
+            users = " ".join(f"<@{uid}>" for uid in done_ids[:15])
+            if len(done_ids) > 15:
+                users += f"\nほか{len(done_ids)-15}人"
+            value = (
+                f"{mission['description'] or '説明なし'}\n"
+                f"目標：**{mission['target_value']}** ／ 報酬：**{mission['reward_points']}pt**\n"
+                f"達成：**{len(done_ids)}人**"
+            )
+            if users:
+                value += f"\n{users}"
+            embed.add_field(
+                name=f"`#{mission['id']}` {mission_type_label(mission['mission_type'])}｜{mission['name']}",
+                value=truncate(value),
+                inline=False,
+            )
+
+    embed.set_footer(text="達成状況は自動更新されます")
+    return embed
+
+
+async def refresh_mission_message(guild: discord.Guild, mission_date: Optional[str] = None):
+    date_value = mission_date or mission_date_jst()
+    day = await db.mission_day_get(guild.id, date_value)
+    channel = await get_setting_channel(guild, "mission_channel_id")
+    if not channel:
+        return None
+
+    embed = await build_mission_embed(guild, date_value)
+    message = None
+    if day and day.get("message_id"):
+        try:
+            message = await channel.fetch_message(int(day["message_id"]))
+        except (discord.NotFound, discord.HTTPException, ValueError):
+            message = None
+
+    if message:
+        await message.edit(embed=embed)
+    else:
+        message = await channel.send(embed=embed)
+        await db.mission_day_upsert(guild.id, date_value, channel.id, message.id)
+    return message
+
+
+async def post_daily_missions(guild: discord.Guild):
+    await db.mission_ensure_defaults(guild.id)
+    today = mission_date_jst()
+    yesterday = (local_now().date() - timedelta(days=1)).isoformat()
+    await db.mission_day_close(guild.id, yesterday)
+    return await refresh_mission_message(guild, today)
+
+
+@tasks.loop(minutes=1)
+async def mission_scheduler():
+    now = local_now()
+    for guild in bot.guilds:
+        await db.mission_ensure_defaults(guild.id)
+        day = await db.mission_day_get(guild.id, now.date().isoformat())
+        # Bot再起動後も、その日の投稿がなければ自動投稿
+        if not day:
+            try:
+                await post_daily_missions(guild)
+            except discord.HTTPException:
+                log.exception("ミッション投稿失敗")
+        elif now.hour == 0 and now.minute <= 2:
+            try:
+                await refresh_mission_message(guild, now.date().isoformat())
+            except discord.HTTPException:
+                log.exception("ミッション更新失敗")
+
+
+@mission_scheduler.before_loop
+async def before_mission_scheduler():
+    await bot.wait_until_ready()
+
+
+async def update_mission_progress(
+    guild: discord.Guild,
+    user_id: int,
+    mission_type: str,
+    amount: int,
+):
+    completed = await db.mission_add_progress(
+        guild.id,
+        mission_date_jst(),
+        user_id,
+        mission_type,
+        amount,
+    )
+    if completed:
+        try:
+            await refresh_mission_message(guild)
+        except discord.HTTPException:
+            pass
+
+
+# =========================================================
+# Dashboard
+# =========================================================
+
+async def build_dashboard(guild: discord.Guild):
+    now = utcnow()
+    day_stats = await db.dashboard_stats(guild.id, now - timedelta(days=1))
+    week_stats = await db.dashboard_stats(guild.id, now - timedelta(days=7))
+
+    humans = [m for m in guild.members if not m.bot]
+    online = [m for m in humans if m.status != discord.Status.offline]
+    vc_members = {
+        m.id
+        for channel in guild.voice_channels
+        for m in channel.members
+        if not m.bot
+    }
+
+    holiday_active = await db.get_setting(guild.id, "holiday_active", "0")
+    holiday_auto = await db.get_setting(guild.id, "holiday_auto", "0")
+    categories = await db.holiday_categories(guild.id)
+
+    embed = discord.Embed(
+        title="🛡️ Puraudhia 管理ダッシュボード",
+        color=EMBED_COLOR,
+        timestamp=utcnow(),
+    )
+    embed.add_field(name="👥 メンバー", value=f"{len(humans)}人", inline=True)
+    embed.add_field(name="🟢 オンライン", value=f"{len(online)}人", inline=True)
+    embed.add_field(name="🎙 現在VC", value=f"{len(vc_members)}人", inline=True)
+
+    embed.add_field(
+        name="📊 直近24時間",
+        value=(
+            f"VC利用者：{day_stats['unique_vc']}人\n"
+            f"VC開始：{day_stats['vc_sessions']}回\n"
+            f"合計：{fmt_duration(day_stats['vc_seconds'])}"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="📈 直近7日間",
+        value=(
+            f"VC利用者：{week_stats['unique_vc']}人\n"
+            f"VC開始：{week_stats['vc_sessions']}回\n"
+            f"合計：{fmt_duration(week_stats['vc_seconds'])}"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="🚪 直近7日の出入り",
+        value=(
+            f"加入：{week_stats['events'].get('join', 0)}人\n"
+            f"退出：{week_stats['events'].get('leave', 0)}人\n"
+            f"BAN：{week_stats['events'].get('ban', 0)}人"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="🌙 Holiday",
+        value=(
+            f"現在：{'🔴 CLOSED' if holiday_active == '1' else '🟢 OPEN'}\n"
+            f"土日自動：{'ON' if holiday_auto == '1' else 'OFF'}\n"
+            f"対象：{len(categories)}カテゴリー"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="5分ごとに自動更新")
+    return embed
+
+
+@tasks.loop(minutes=DASHBOARD_UPDATE_MINUTES)
+async def dashboard_updater():
+    for guild in bot.guilds:
+        channel = await get_setting_channel(
+            guild,
+            "dashboard_channel_id",
+            DASHBOARD_CHANNEL_ID,
+        )
+        if not channel:
+            continue
+
+        message_id = await db.get_setting(guild.id, "dashboard_message_id")
+        embed = await build_dashboard(guild)
+
+        message = None
+        if message_id:
+            try:
+                message = await channel.fetch_message(int(message_id))
+            except (discord.NotFound, discord.HTTPException, ValueError):
+                message = None
+
+        try:
+            if message:
+                await message.edit(embed=embed, view=ManagementPanelView())
+            else:
+                message = await channel.send(embed=embed, view=ManagementPanelView())
+                await db.set_setting(guild.id, "dashboard_message_id", message.id)
+        except discord.HTTPException:
+            log.exception("ダッシュボード更新失敗")
+
+
+@dashboard_updater.before_loop
+async def before_dashboard():
+    await bot.wait_until_ready()
+
+
+# =========================================================
+# 管理パネル
+# =========================================================
+
+class ManagementPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def allowed(self, interaction: discord.Interaction) -> bool:
+        if await is_manager(interaction):
+            return True
+        await private_reply(interaction, "このパネルは運営専用です。")
+        return False
+
+    @discord.ui.button(
+        label="状態確認",
+        emoji="📊",
+        style=discord.ButtonStyle.primary,
+        custom_id="management:status",
+    )
+    async def status(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not await self.allowed(interaction):
+            return
+        embed = await build_dashboard(interaction.guild)
+        await private_reply(interaction, embed=embed)
+
+    @discord.ui.button(
+        label="Holiday開始",
+        emoji="🌙",
+        style=discord.ButtonStyle.danger,
+        custom_id="management:holiday_on",
+    )
+    async def holiday_on(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not await self.allowed(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
+        _, message = await apply_holiday(interaction.guild, interaction.user)
+        await interaction.followup.send(message, ephemeral=True)
+
+    @discord.ui.button(
+        label="Holiday終了",
+        emoji="🌸",
+        style=discord.ButtonStyle.success,
+        custom_id="management:holiday_off",
+    )
+    async def holiday_off(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not await self.allowed(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
+        _, message = await restore_holiday(interaction.guild, interaction.user)
+        await interaction.followup.send(message, ephemeral=True)
+
+
+# =========================================================
+# Events / Logs
+# =========================================================
+
+@bot.event
+async def on_ready():
+    if not bot.synced:
+        try:
+            guild = target_guild()
+            synced = await bot.tree.sync(guild=guild)
+            bot.synced = True
+            log.info("%s に %s件同期", GUILD_ID, len(synced))
+        except Exception:
+            log.exception("コマンド同期失敗")
+
+    for guild in bot.guilds:
+        await db.mission_ensure_defaults(guild.id)
+        for member in guild.members:
+            if not member.bot:
+                await db.upsert_member(member)
+
+        # 再起動時、VCにいる人のセッションを開始
+        for channel in guild.voice_channels:
+            for member in channel.members:
+                if not member.bot:
+                    await db.start_voice(member, channel)
+
+    log.info("ログイン完了: %s", bot.user)
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    if member.bot:
+        return
+    await db.upsert_member(member)
+    await db.add_event(member.guild.id, member.id, "join")
+
+    embed = discord.Embed(
+        title="📥 メンバー加入",
+        description=f"{member.mention}\n`{member}`\nID: `{member.id}`",
+        color=discord.Color.green(),
+        timestamp=utcnow(),
+    )
+    if member.created_at:
+        embed.add_field(name="アカウント作成", value=fmt_dt(member.created_at), inline=False)
+    await send_log(member.guild, embed, join_leave=True)
+
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    if member.bot:
+        return
+
+    actor_id = None
+    event_type = "leave"
+    details = None
+
+    try:
+        async for entry in member.guild.audit_logs(
+            limit=5,
+            action=discord.AuditLogAction.kick,
+        ):
+            if entry.target and entry.target.id == member.id:
+                if (utcnow() - entry.created_at).total_seconds() < 15:
+                    event_type = "kick"
+                    actor_id = entry.user.id if entry.user else None
+                    details = entry.reason
+                    break
+    except discord.Forbidden:
+        pass
+
+    await db.mark_left(member.guild.id, member.id)
+    await db.add_event(member.guild.id, member.id, event_type, actor_id, details)
+
+    embed = discord.Embed(
+        title="🥾 Kick" if event_type == "kick" else "📤 メンバー退出",
+        description=f"`{member}`\nID: `{member.id}`",
+        color=discord.Color.red(),
+        timestamp=utcnow(),
+    )
+    if actor_id:
+        embed.add_field(name="実行者", value=f"<@{actor_id}>", inline=False)
+    if details:
+        embed.add_field(name="理由", value=truncate(details), inline=False)
+    await send_log(member.guild, embed, join_leave=True)
+
+
+@bot.event
+async def on_member_ban(guild: discord.Guild, user: discord.User):
+    actor = None
+    reason = None
+    try:
+        async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.ban):
+            if entry.target and entry.target.id == user.id:
+                actor = entry.user
+                reason = entry.reason
+                break
+    except discord.Forbidden:
+        pass
+
+    await db.add_event(
+        guild.id,
+        user.id,
+        "ban",
+        actor.id if actor else None,
+        reason,
+    )
+    embed = discord.Embed(
+        title="🔨 BAN",
+        description=f"`{user}`\nID: `{user.id}`",
+        color=discord.Color.dark_red(),
+        timestamp=utcnow(),
+    )
+    if actor:
+        embed.add_field(name="実行者", value=actor.mention, inline=True)
+    if reason:
+        embed.add_field(name="理由", value=truncate(reason), inline=False)
+    await send_log(guild, embed)
+
+
+@bot.event
+async def on_member_unban(guild: discord.Guild, user: discord.User):
+    await db.add_event(guild.id, user.id, "unban")
+    embed = discord.Embed(
+        title="🔓 Unban",
+        description=f"`{user}`\nID: `{user.id}`",
+        color=discord.Color.green(),
+        timestamp=utcnow(),
+    )
+    await send_log(guild, embed)
+
 
 @bot.event
 async def on_voice_state_update(
     member: discord.Member,
     before: discord.VoiceState,
     after: discord.VoiceState,
-) -> None:
-    if member.guild.id != GUILD_ID or not should_track_member(member):
-        return
-    if before.channel == after.channel:
+):
+    if member.bot or before.channel == after.channel:
         return
 
-    await ensure_member_record(member)
-
-    before_ch = before.channel
-    after_ch = after.channel
-    before_trackable = before_ch is not None and not is_excluded_channel(before_ch)
-    after_trackable = after_ch is not None and not is_excluded_channel(after_ch)
-
-    if before_trackable and not after_trackable:
-        duration = await db.end_voice_session(member.guild.id, member.id)
-        await db.record_voice_event(member.guild.id, member.id, "leave", before_ch, after_ch)
-        await send_log(
-            member.guild,
-            title="🎤 VC退出",
+    if before.channel:
+        seconds = await db.end_voice(member.guild.id, member.id)
+        completed_minutes = seconds // 60
+        if completed_minutes > 0:
+            await update_mission_progress(
+                member.guild,
+                member.id,
+                "voice_minutes",
+                completed_minutes,
+            )
+        embed = discord.Embed(
+            title="🔴 VC退出",
             description=(
                 f"{member.mention}\n"
-                f"退出: **{before_ch.name}**\n"
-                f"滞在: **{fmt_duration(duration)}**"
+                f"退出：{before.channel.mention}\n"
+                f"滞在：**{fmt_duration(seconds)}**"
             ),
-            color=discord.Color.orange(),
+            color=discord.Color.red(),
+            timestamp=utcnow(),
         )
+        await send_log(member.guild, embed)
 
-    elif not before_trackable and after_trackable:
-        await db.start_voice_session(member, after_ch)
-        await db.record_voice_event(member.guild.id, member.id, "join", before_ch, after_ch)
-        await send_log(
-            member.guild,
-            title="🎤 VC入室",
-            description=f"{member.mention}\n入室: **{after_ch.name}**",
+    if after.channel:
+        await db.upsert_member(member)
+        await db.start_voice(member, after.channel)
+        await update_mission_progress(member.guild, member.id, "voice_join", 1)
+        embed = discord.Embed(
+            title="🟢 VC入室",
+            description=f"{member.mention}\n入室：{after.channel.mention}",
             color=discord.Color.green(),
+            timestamp=utcnow(),
         )
+        await send_log(member.guild, embed)
 
-    elif before_trackable and after_trackable:
-        duration = await db.end_voice_session(member.guild.id, member.id)
-        await db.start_voice_session(member, after_ch)
-        await db.record_voice_event(member.guild.id, member.id, "move", before_ch, after_ch)
-        await send_log(
-            member.guild,
-            title="🔁 VC移動",
-            description=(
-                f"{member.mention}\n"
-                f"**{before_ch.name}** → **{after_ch.name}**\n"
-                f"移動前滞在: **{fmt_duration(duration)}**"
-            ),
-            color=discord.Color.blue(),
-        )
-
-    await db.record_concurrency(member.guild.id, len(active_voice_members(member.guild)))
 
 @bot.event
-async def on_member_update(before: discord.Member, after: discord.Member) -> None:
-    if after.guild.id != GUILD_ID or after.bot:
-        return
+async def on_message(message: discord.Message):
+    if message.guild and not message.author.bot:
+        await update_mission_progress(message.guild, message.author.id, "messages", 1)
+    await bot.process_commands(message)
 
-    changes: list[str] = []
+
+@bot.event
+async def on_message_delete(message: discord.Message):
+    if not message.guild or message.author.bot:
+        return
+    embed = discord.Embed(
+        title="🗑️ メッセージ削除",
+        description=(
+            f"投稿者：{message.author.mention}\n"
+            f"チャンネル：{message.channel.mention}\n\n"
+            f"```{truncate(message.content, 1500)}```"
+        ),
+        color=discord.Color.orange(),
+        timestamp=utcnow(),
+    )
+    await send_log(message.guild, embed)
+
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    if not before.guild or before.author.bot or before.content == after.content:
+        return
+    embed = discord.Embed(
+        title="✏️ メッセージ編集",
+        description=f"投稿者：{before.author.mention}\nチャンネル：{before.channel.mention}",
+        color=discord.Color.gold(),
+        timestamp=utcnow(),
+    )
+    embed.add_field(name="編集前", value=truncate(before.content), inline=False)
+    embed.add_field(name="編集後", value=truncate(after.content), inline=False)
+    embed.add_field(name="メッセージ", value=f"[移動]({after.jump_url})", inline=False)
+    await send_log(before.guild, embed)
+
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    changes = []
 
     if before.nick != after.nick:
-        changes.append(f"ニックネーム: `{before.display_name}` → `{after.display_name}`")
+        changes.append(f"ニックネーム：`{before.nick}` → `{after.nick}`")
 
-    before_roles = {r.id: r for r in before.roles if not r.is_default()}
-    after_roles = {r.id: r for r in after.roles if not r.is_default()}
+    before_roles = {r.id: r for r in before.roles}
+    after_roles = {r.id: r for r in after.roles}
     added = [r.mention for rid, r in after_roles.items() if rid not in before_roles]
     removed = [r.mention for rid, r in before_roles.items() if rid not in after_roles]
+
     if added:
-        changes.append("追加ロール: " + ", ".join(added))
+        changes.append("追加ロール：" + " ".join(added))
     if removed:
-        changes.append("削除ロール: " + ", ".join(removed))
+        changes.append("解除ロール：" + " ".join(removed))
 
     if before.timed_out_until != after.timed_out_until:
-        if after.timed_out_until:
-            changes.append(f"タイムアウト: {fmt_dt(after.timed_out_until)} まで")
-            event_type = "timeout_add"
-        else:
-            changes.append("タイムアウト解除")
-            event_type = "timeout_remove"
-        await db.add_member_event(
-            after.guild.id,
-            after.id,
-            event_type,
-            details="\n".join(changes),
+        changes.append(
+            f"Timeout：{fmt_dt(before.timed_out_until)} → {fmt_dt(after.timed_out_until)}"
         )
 
-    if changes:
-        await db.upsert_member(after)
-        await send_log(
-            after.guild,
-            title="🛠️ メンバー情報変更",
-            description=f"{after.mention}\n" + "\n".join(changes),
-            color=discord.Color.gold(),
-        )
-
-# =========================================================
-# Embed生成
-# =========================================================
-
-def stats_embed(
-    title: str,
-    stats: dict[str, Any],
-    *,
-    previous: Optional[dict[str, Any]] = None,
-    average_rate: Optional[float] = None,
-    highest_rate: Optional[float] = None,
-) -> discord.Embed:
-    embed = discord.Embed(
-        title=title,
-        color=EMBED_COLOR,
-        timestamp=utcnow(),
-    )
-
-    new_count = stats["new_members"]
-    participated = stats["new_vc_members"]
-    new_rate = (
-        participated / new_count * 100
-        if new_count
-        else 0
-    )
-
-    embed.add_field(
-        name="🎤 VC",
-        value=(
-            f"利用者: **{stats['unique_users']}人**\n"
-            f"開始回数: **{stats['session_starts']}回**\n"
-            f"合計滞在: **{fmt_duration(stats['total_seconds'])}**\n"
-            f"最大同時接続: **{stats['max_concurrent']}人**"
-        ),
-        inline=False,
-    )
-
-    if "overall_participation_rate" in stats:
-        lines = [
-            f"対象メンバー: **{stats['eligible_members']}人**",
-            f"VC利用者: **{stats['unique_users']}人**",
-            (
-                f"全体参加率: "
-                f"**{stats['overall_participation_rate']:.1f}%**"
-            ),
-            (
-                f"サーバーランク: "
-                f"**{stats['participation_rank_icon']} "
-                f"{stats['participation_rank']}**"
-            ),
-        ]
-        if average_rate is not None:
-            lines.append(
-                f"日別平均参加率: **{average_rate:.1f}%**"
-            )
-        if highest_rate is not None:
-            lines.append(
-                f"期間内最高参加率: **{highest_rate:.1f}%**"
-            )
-
-        embed.add_field(
-            name="📈 サーバー全体参加率",
-            value="\n".join(lines),
-            inline=False,
-        )
-
-    embed.add_field(
-        name="👥 メンバー",
-        value=(
-            f"加入: **{stats['joins']}人**\n"
-            f"退出: **{stats['leaves']}人**\n"
-            f"Kick: **{stats['kicks']}人**\n"
-            f"BAN: **{stats['bans']}人**\n"
-            f"純増減: "
-            f"**{stats['joins'] - stats['leaves'] - stats['kicks'] - stats['bans']:+d}人**"
-        ),
-        inline=True,
-    )
-
-    embed.add_field(
-        name="🌱 新規VC参加",
-        value=(
-            f"対象: **{new_count}人**\n"
-            f"VC参加済み: **{participated}人**\n"
-            f"参加率: **{new_rate:.1f}%**"
-        ),
-        inline=True,
-    )
-
-    if previous:
-        def pct(current: int, old: int) -> str:
-            if old == 0:
-                return "比較不能" if current else "±0%"
-            return f"{((current - old) / old * 100):+.1f}%"
-
-        embed.add_field(
-            name="📈 前期間との比較",
-            value=(
-                f"VC利用者: "
-                f"**{pct(stats['unique_users'], previous['unique_users'])}**\n"
-                f"合計滞在: "
-                f"**{pct(stats['total_seconds'], previous['total_seconds'])}**\n"
-                f"新規加入: "
-                f"**{pct(stats['joins'], previous['joins'])}**"
-            ),
-            inline=False,
-        )
-
-    return embed
-
-async def build_dashboard_embed(
-    guild: discord.Guild,
-) -> discord.Embed:
-    week_start, week_end = range_bounds(7)
-    week_stats = await db.stats(
-        guild.id,
-        week_start,
-        week_end,
-    )
-    week_stats = add_participation_data(
-        week_stats,
-        guild,
-    )
-
-    today_start, _ = local_day_bounds(0)
-    today_stats = await db.stats(
-        guild.id,
-        today_start,
-        utcnow(),
-    )
-    today_stats = add_participation_data(
-        today_stats,
-        guild,
-    )
-
-    active = active_voice_members(guild)
+    if not changes:
+        return
 
     embed = discord.Embed(
-        title="👑 Puraudhia 管理ダッシュボード",
-        description="運営専用・自動更新",
-        color=EMBED_COLOR,
+        title="👤 メンバー情報変更",
+        description=f"{after.mention}\n" + "\n".join(changes),
+        color=discord.Color.blurple(),
         timestamp=utcnow(),
     )
+    await send_log(after.guild, embed)
 
-    embed.add_field(
-        name="🏫 現在",
-        value=(
-            f"対象メンバー: "
-            f"**{today_stats['eligible_members']}人**\n"
-            f"現在VC: **{len(active)}人**\n"
-            f"稼働VC: "
-            f"**{len({m.voice.channel.id for m in active if m.voice and m.voice.channel})}部屋**"
-        ),
-        inline=False,
-    )
-
-    if active:
-        lines = []
-        for member in active[:20]:
-            channel_name = (
-                member.voice.channel.name
-                if member.voice and member.voice.channel
-                else "不明"
-            )
-            lines.append(
-                f"• {member.mention} — **{channel_name}**"
-            )
-        embed.add_field(
-            name="🎙️ 現在VC中",
-            value="\n".join(lines),
-            inline=False,
-        )
-    else:
-        embed.add_field(
-            name="🎙️ 現在VC中",
-            value="現在、VC利用者はいません。",
-            inline=False,
-        )
-
-    embed.add_field(
-        name="📈 今日の全体参加率",
-        value=(
-            f"VC利用者: **{today_stats['unique_users']}人**\n"
-            f"参加率: "
-            f"**{today_stats['overall_participation_rate']:.1f}%**\n"
-            f"サーバーランク: "
-            f"**{today_stats['participation_rank_icon']} "
-            f"{today_stats['participation_rank']}**\n"
-            f"最大同時接続: "
-            f"**{today_stats['max_concurrent']}人**"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="📊 直近7日",
-        value=(
-            f"期間内利用者: **{week_stats['unique_users']}人**\n"
-            f"期間内参加率: "
-            f"**{week_stats['overall_participation_rate']:.1f}%**\n"
-            f"合計滞在: "
-            f"**{fmt_duration(week_stats['total_seconds'])}**\n"
-            f"加入 / 退出: "
-            f"**{week_stats['joins']} / "
-            f"{week_stats['leaves'] + week_stats['kicks'] + week_stats['bans']}**"
-        ),
-        inline=False,
-    )
-
-    embed.set_footer(
-        text=f"{DASHBOARD_UPDATE_MINUTES}分ごとに自動更新"
-    )
-    return embed
 
 # =========================================================
-# Slash Commands
+# 設定コマンド
 # =========================================================
 
-@bot.tree.command(name="今日の統計", description="本日のVC・加入・退出状況を表示します。")
+@bot.tree.command(name="管理パネル", description="運営専用管理パネルを表示します")
 @app_commands.guilds(target_guild())
 @manager_only()
-async def today_stats(interaction: discord.Interaction) -> None:
-    await interaction.response.defer(
-        ephemeral=True,
-        thinking=True,
-    )
-    start, _ = local_day_bounds(0)
-    stats = await db.stats(
-        interaction.guild_id,
-        start,
-        utcnow(),
-    )
-    stats = add_participation_data(
-        stats,
-        interaction.guild,
-    )
-    await private_reply(
-        interaction,
-        embed=stats_embed("📊 今日の統計", stats),
-    )
+async def management_panel(interaction: discord.Interaction):
+    embed = await build_dashboard(interaction.guild)
+    await private_reply(interaction, embed=embed, view=ManagementPanelView())
 
-@bot.tree.command(name="週間統計", description="直近7日間と、その前7日間を比較します。")
+
+@bot.tree.command(name="管理ロール設定", description="管理コマンドを使えるロールを設定します")
 @app_commands.guilds(target_guild())
 @manager_only()
-async def weekly_stats(interaction: discord.Interaction) -> None:
-    await interaction.response.defer(
-        ephemeral=True,
-        thinking=True,
-    )
-    end = utcnow()
-    start = range_bounds(7)[0]
-    previous_start = start - timedelta(days=7)
+async def set_admin_role(interaction: discord.Interaction, role: discord.Role):
+    await db.set_setting(interaction.guild.id, "admin_role_id", role.id)
+    await private_reply(interaction, f"✅ 管理ロールを {role.mention} に設定しました。")
 
-    current = await db.stats(
-        interaction.guild_id,
-        start,
-        end,
-    )
-    previous = await db.stats(
-        interaction.guild_id,
-        previous_start,
-        start,
-    )
 
-    current = add_participation_data(
-        current,
-        interaction.guild,
-    )
-    previous = add_participation_data(
-        previous,
-        interaction.guild,
-    )
-    average_rate, highest_rate = (
-        await average_daily_participation(
-            interaction.guild,
-            7,
-        )
-    )
-
-    await private_reply(
-        interaction,
-        embed=stats_embed(
-            "📈 週間統計（直近7日）",
-            current,
-            previous=previous,
-            average_rate=average_rate,
-            highest_rate=highest_rate,
-        ),
-    )
-
-@bot.tree.command(name="月間統計", description="直近30日間と、その前30日間を比較します。")
+@bot.tree.command(name="管理ログ設定", description="管理ログの送信先を設定します")
 @app_commands.guilds(target_guild())
 @manager_only()
-async def monthly_stats(interaction: discord.Interaction) -> None:
-    await interaction.response.defer(
-        ephemeral=True,
-        thinking=True,
-    )
-    end = utcnow()
-    start = range_bounds(30)[0]
-    previous_start = start - timedelta(days=30)
+async def set_management_log(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+):
+    await db.set_setting(interaction.guild.id, "management_log_channel_id", channel.id)
+    await private_reply(interaction, f"✅ 管理ログを {channel.mention} に設定しました。")
 
-    current = await db.stats(
-        interaction.guild_id,
-        start,
-        end,
-    )
-    previous = await db.stats(
-        interaction.guild_id,
-        previous_start,
-        start,
-    )
 
-    current = add_participation_data(
-        current,
+@bot.tree.command(name="入退室ログ設定", description="加入・退出ログの送信先を設定します")
+@app_commands.guilds(target_guild())
+@manager_only()
+async def set_join_leave_log(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+):
+    await db.set_setting(interaction.guild.id, "join_leave_log_channel_id", channel.id)
+    await private_reply(interaction, f"✅ 入退室ログを {channel.mention} に設定しました。")
+
+
+@bot.tree.command(name="ダッシュボード設定", description="自動更新ダッシュボードのチャンネルを設定します")
+@app_commands.guilds(target_guild())
+@manager_only()
+async def set_dashboard_channel(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+):
+    await db.set_setting(interaction.guild.id, "dashboard_channel_id", channel.id)
+    await db.set_setting(interaction.guild.id, "dashboard_message_id", "0")
+    await private_reply(interaction, f"✅ ダッシュボードを {channel.mention} に設定しました。")
+
+
+@bot.tree.command(name="ダッシュボード設置", description="管理ダッシュボードを今すぐ設置します")
+@app_commands.guilds(target_guild())
+@manager_only()
+async def dashboard_create(interaction: discord.Interaction):
+    channel = await get_setting_channel(
         interaction.guild,
+        "dashboard_channel_id",
+        DASHBOARD_CHANNEL_ID,
     )
-    previous = add_participation_data(
-        previous,
-        interaction.guild,
-    )
-    average_rate, highest_rate = (
-        await average_daily_participation(
-            interaction.guild,
-            30,
-        )
-    )
+    if not channel:
+        return await private_reply(interaction, "❌ ダッシュボードチャンネルが見つかりません。")
 
-    await private_reply(
-        interaction,
-        embed=stats_embed(
-            "📆 月間統計（直近30日）",
-            current,
-            previous=previous,
-            average_rate=average_rate,
-            highest_rate=highest_rate,
-        ),
-    )
+    embed = await build_dashboard(interaction.guild)
+    message = await channel.send(embed=embed, view=ManagementPanelView())
+    await db.set_setting(interaction.guild.id, "dashboard_message_id", message.id)
+    await private_reply(interaction, f"✅ {channel.mention} に設置しました。")
 
-@bot.tree.command(
-    name="全体参加率",
-    description="今日・7日平均・30日平均のVC参加率を表示します。",
+
+# =========================================================
+# Holiday commands
+# =========================================================
+
+holiday_group = app_commands.Group(
+    name="holiday",
+    description="お休みDAYを管理します",
+    guild_ids=[GUILD_ID],
 )
-@app_commands.guilds(target_guild())
+
+
+@holiday_group.command(name="カテゴリー追加", description="お休み対象カテゴリーを追加します")
 @manager_only()
-async def overall_participation(
+async def holiday_add(
     interaction: discord.Interaction,
-) -> None:
-    await interaction.response.defer(
-        ephemeral=True,
-        thinking=True,
-    )
+    category: discord.CategoryChannel,
+):
+    await db.add_holiday_category(interaction.guild.id, category.id)
+    await private_reply(interaction, f"✅ **{category.name}** を対象に追加しました。")
 
-    guild = interaction.guild
-    total = eligible_member_count(guild)
 
-    today_start, _ = local_day_bounds(0)
-    today = await db.stats(
-        interaction.guild_id,
-        today_start,
-        utcnow(),
-    )
-    today = add_participation_data(today, guild)
+@holiday_group.command(name="カテゴリー削除", description="お休み対象カテゴリーから削除します")
+@manager_only()
+async def holiday_remove(
+    interaction: discord.Interaction,
+    category: discord.CategoryChannel,
+):
+    active = await db.get_setting(interaction.guild.id, "holiday_active", "0")
+    if active == "1":
+        return await private_reply(
+            interaction,
+            "先に `/holiday 終了` でお休みモードを終了してください。",
+        )
+    await db.remove_holiday_category(interaction.guild.id, category.id)
+    await private_reply(interaction, f"✅ **{category.name}** を対象から削除しました。")
 
-    week_average, week_highest = (
-        await average_daily_participation(guild, 7)
-    )
-    month_average, month_highest = (
-        await average_daily_participation(guild, 30)
-    )
 
-    current_rate = today["overall_participation_rate"]
-    current_icon, current_rank = participation_rank(
-        current_rate
-    )
-
-    next_target_text = "👑 最高ランク達成！"
-    for target, name in (
-        (10, "BRONZE"),
-        (20, "SILVER"),
-        (30, "GOLD"),
-        (40, "DIAMOND"),
-        (50, "LEGEND"),
-    ):
-        if current_rate < target:
-            needed = max(
-                1,
-                int(
-                    target / 100 * total
-                    - today["unique_users"]
-                    + 0.9999
-                ),
-            )
-            next_target_text = (
-                f"次の **{name}** まであと "
-                f"**{target - current_rate:.1f}%**"
-                f"（約{needed}人）"
-            )
-            break
-
-    embed = discord.Embed(
-        title="📈 Puraudhia 全体参加率",
-        color=EMBED_COLOR,
-        timestamp=utcnow(),
-    )
-    embed.add_field(
-        name="📊 今日",
-        value=(
-            f"対象メンバー: **{total}人**\n"
-            f"VC利用者: **{today['unique_users']}人**\n"
-            f"参加率: **{current_rate:.1f}%**\n"
-            f"ランク: **{current_icon} {current_rank}**"
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="📅 直近7日",
-        value=(
-            f"日別平均: **{week_average:.1f}%**\n"
-            f"最高記録: **{week_highest:.1f}%**"
-        ),
-        inline=True,
-    )
-    embed.add_field(
-        name="🗓️ 直近30日",
-        value=(
-            f"日別平均: **{month_average:.1f}%**\n"
-            f"最高記録: **{month_highest:.1f}%**"
-        ),
-        inline=True,
-    )
-    embed.add_field(
-        name="🎯 次の目標",
-        value=next_target_text,
-        inline=False,
-    )
-    embed.set_footer(
-        text="Botと除外ユーザーは分母に含みません。"
-    )
-
+@holiday_group.command(name="カテゴリー一覧", description="登録済みカテゴリーを表示します")
+@manager_only()
+async def holiday_list(interaction: discord.Interaction):
+    ids = await db.holiday_categories(interaction.guild.id)
+    lines = []
+    for cid in ids:
+        category = interaction.guild.get_channel(cid)
+        lines.append(f"• {category.name if category else '削除済み'} (`{cid}`)")
     await private_reply(
         interaction,
-        embed=embed,
+        embed=discord.Embed(
+            title="🌙 Holiday対象カテゴリー",
+            description="\n".join(lines) if lines else "登録されていません。",
+            color=EMBED_COLOR,
+        ),
     )
 
 
-@bot.tree.command(name="vcランキング", description="指定期間のVC滞在時間ランキングを表示します。")
-@app_commands.describe(日数="1〜90日")
-@app_commands.guilds(target_guild())
+@holiday_group.command(name="開始", description="対象カテゴリーを今すぐ休止します")
 @manager_only()
-async def vc_ranking(
+async def holiday_start(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    _, message = await apply_holiday(interaction.guild, interaction.user)
+    await interaction.followup.send(message, ephemeral=True)
+
+
+@holiday_group.command(name="終了", description="対象カテゴリーを今すぐ復元します")
+@manager_only()
+async def holiday_end(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    _, message = await restore_holiday(interaction.guild, interaction.user)
+    await interaction.followup.send(message, ephemeral=True)
+
+
+@holiday_group.command(name="自動設定", description="毎週土日に自動休止するか設定します")
+@app_commands.describe(有効="ONで土日自動休止、OFFで手動管理")
+@manager_only()
+async def holiday_auto(interaction: discord.Interaction, 有効: bool):
+    await db.set_setting(interaction.guild.id, "holiday_auto", "1" if 有効 else "0")
+    await private_reply(
+        interaction,
+        f"✅ 土日自動Holidayを **{'ON' if 有効 else 'OFF'}** にしました。",
+    )
+
+
+@holiday_group.command(name="通知設定", description="開始・終了のお知らせチャンネルを設定します")
+@manager_only()
+async def holiday_notice(
     interaction: discord.Interaction,
-    日数: app_commands.Range[int, 1, 90] = 7,
-) -> None:
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    start, end = range_bounds(日数)
-    rows = await db.top_voice(interaction.guild_id, start, end, 15)
+    channel: discord.TextChannel,
+):
+    await db.set_setting(interaction.guild.id, "holiday_notice_channel_id", channel.id)
+    await private_reply(interaction, f"✅ Holiday通知先を {channel.mention} に設定しました。")
 
-    embed = discord.Embed(
-        title=f"🏆 VCランキング（直近{日数}日）",
-        color=EMBED_COLOR,
-        timestamp=utcnow(),
-    )
-    if not rows:
-        embed.description = "該当データはありません。"
-    else:
-        embed.description = "\n".join(
-            f"**{i}.** <@{uid}> — **{fmt_duration(seconds)}** / {sessions}回"
-            for i, (uid, seconds, sessions) in enumerate(rows, 1)
-        )
-    await private_reply(interaction, embed=embed)
 
-@bot.tree.command(name="メンバー確認", description="メンバーカルテを表示します。")
-@app_commands.guilds(target_guild())
+@holiday_group.command(name="状態", description="現在のHoliday設定を確認します")
 @manager_only()
-async def member_check(interaction: discord.Interaction, メンバー: discord.Member) -> None:
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    await ensure_member_record(メンバー)
-    data = await db.member_card(interaction.guild_id, メンバー.id)
-    record = data["member"] or {}
-    interview = data["interview"]
-    note = data["note"]
+async def holiday_status(interaction: discord.Interaction):
+    active = await db.get_setting(interaction.guild.id, "holiday_active", "0")
+    auto = await db.get_setting(interaction.guild.id, "holiday_auto", "0")
+    ids = await db.holiday_categories(interaction.guild.id)
+    notice = await get_setting_channel(interaction.guild, "holiday_notice_channel_id")
 
-    embed = discord.Embed(
-        title=f"👤 メンバーカルテ｜{メンバー.display_name}",
-        color=EMBED_COLOR,
-        timestamp=utcnow(),
-    )
-    embed.set_thumbnail(url=メンバー.display_avatar.url)
+    embed = discord.Embed(title="🌙 Holiday設定", color=EMBED_COLOR)
     embed.add_field(
-        name="基本情報",
-        value=(
-            f"ユーザー: {メンバー.mention}\n"
-            f"ID: `{メンバー.id}`\n"
-            f"加入: {fmt_dt(parse_dt(record.get('joined_at')))}\n"
-            f"初VC: {fmt_dt(parse_dt(record.get('first_vc_at')))}\n"
-            f"最終VC: {fmt_dt(parse_dt(record.get('last_vc_at')), 'R')}"
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="VC記録",
-        value=(
-            f"参加回数: **{data['vc_sessions']}回**\n"
-            f"合計滞在: **{fmt_duration(data['vc_seconds'])}**"
-        ),
+        name="現在",
+        value="🔴 お休み中" if active == "1" else "🟢 通常営業",
         inline=True,
     )
+    embed.add_field(name="土日自動", value="ON" if auto == "1" else "OFF", inline=True)
+    embed.add_field(name="対象数", value=f"{len(ids)}カテゴリー", inline=True)
     embed.add_field(
-        name="管理情報",
-        value=(
-            f"有効警告: **{data['warning_count']}件**\n"
-            f"面接: **{'登録済み' if interview else '未登録'}**"
-        ),
-        inline=True,
-    )
-
-    if interview:
-        embed.add_field(
-            name="最新の面接記録",
-            value=(
-                f"担当: <@{interview['interviewer_id']}>\n"
-                f"結果: **{interview['result']}**\n"
-                f"知った場所: {safe_text(interview['source'], 200)}\n"
-                f"BAN履歴: **{interview['ban_history']}**\n"
-                f"同性会話: **{interview['same_gender_ok']}**\n"
-                f"メモ: {safe_text(interview['memo'], 500)}"
-            ),
-            inline=False,
-        )
-
-    embed.add_field(
-        name="運営メモ",
-        value=safe_text(note["note"] if note else None, 1000),
+        name="通知先",
+        value=notice.mention if notice else "未設定",
         inline=False,
     )
     await private_reply(interaction, embed=embed)
 
-RESULT_CHOICES = [
-    app_commands.Choice(name="合格", value="合格"),
-    app_commands.Choice(name="保留", value="保留"),
-    app_commands.Choice(name="不合格", value="不合格"),
-]
 
-YES_NO_CHOICES = [
-    app_commands.Choice(name="はい", value="はい"),
-    app_commands.Choice(name="いいえ", value="いいえ"),
-    app_commands.Choice(name="不明", value="不明"),
-]
+bot.tree.add_command(holiday_group)
 
-@bot.tree.command(name="面接登録", description="面接内容をメンバーカルテへ保存します。")
+# =========================================================
+# Mission commands
+# =========================================================
+
+mission_group = app_commands.Group(
+    name="ミッション",
+    description="デイリーミッションを管理します",
+    guild_ids=[GUILD_ID],
+)
+
+
+@mission_group.command(name="チャンネル設定", description="毎日0時にミッションを投稿するチャンネルを設定します")
+@manager_only()
+async def mission_channel_set(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+):
+    await db.set_setting(interaction.guild.id, "mission_channel_id", channel.id)
+    await db.set_setting(interaction.guild.id, "mission_last_channel_id", channel.id)
+    await private_reply(interaction, f"✅ ミッション投稿先を {channel.mention} に設定しました。")
+
+
+@mission_group.command(name="今すぐ投稿", description="本日のミッションを今すぐ投稿・更新します")
+@manager_only()
+async def mission_post_now(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    message = await post_daily_missions(interaction.guild)
+    if message:
+        await interaction.followup.send("✅ 本日のミッションを投稿・更新しました。", ephemeral=True)
+    else:
+        await interaction.followup.send("❌ 先にミッションチャンネルを設定してください。", ephemeral=True)
+
+
+@mission_group.command(name="追加", description="デイリーミッションを追加します")
 @app_commands.describe(
-    メンバー="面接対象",
-    結果="面接結果",
-    知った場所="DISBOARD、ディス速、紹介など",
-    ban履歴="BAN履歴の申告",
-    同性会話="同性との会話が可能か",
-    メモ="補足事項",
+    種類="VC滞在・VC参加・チャット・手動判定から選択",
+    目標値="VC滞在なら分数、チャットなら回数",
+    報酬ポイント="天真爛漫Botで後から付与するポイント数",
 )
-@app_commands.choices(結果=RESULT_CHOICES, ban履歴=YES_NO_CHOICES, 同性会話=YES_NO_CHOICES)
-@app_commands.guilds(target_guild())
+@app_commands.choices(
+    種類=[
+        app_commands.Choice(name="VC滞在（分）", value="voice_minutes"),
+        app_commands.Choice(name="VC参加（回）", value="voice_join"),
+        app_commands.Choice(name="チャット（回）", value="messages"),
+        app_commands.Choice(name="手動判定", value="manual"),
+    ]
+)
 @manager_only()
-async def interview_register(
+async def mission_add(
     interaction: discord.Interaction,
-    メンバー: discord.Member,
-    結果: app_commands.Choice[str],
-    知った場所: str,
-    ban履歴: app_commands.Choice[str],
-    同性会話: app_commands.Choice[str],
-    メモ: str = "",
-) -> None:
-    await ensure_member_record(メンバー)
-    await db.add_interview(
-        interaction.guild_id,
-        メンバー.id,
+    名前: str,
+    説明: str,
+    種類: app_commands.Choice[str],
+    目標値: app_commands.Range[int, 1, 100000],
+    報酬ポイント: app_commands.Range[int, 0, 1000000],
+):
+    mission_id = await db.mission_create(
+        interaction.guild.id,
+        名前,
+        説明,
+        種類.value,
+        目標値,
+        報酬ポイント,
         interaction.user.id,
-        結果.value,
-        知った場所,
-        ban履歴.value,
-        同性会話.value,
-        メモ,
     )
-    await db.add_member_event(
-        interaction.guild_id,
-        メンバー.id,
-        "interview",
-        interaction.user.id,
-        f"結果={結果.value}; source={知った場所}",
-    )
-    await send_log(
-        interaction.guild,
-        title="📝 面接登録",
-        description=(
-            f"対象: {メンバー.mention}\n"
-            f"担当: {interaction.user.mention}\n"
-            f"結果: **{結果.value}**\n"
-            f"知った場所: {知った場所}\n"
-            f"BAN履歴: **{ban履歴.value}**\n"
-            f"同性会話: **{同性会話.value}**\n"
-            f"メモ: {safe_text(メモ)}"
-        ),
-        color=discord.Color.blue(),
-    )
-    await private_reply(interaction, content=f"✅ {メンバー.mention} の面接記録を保存しました。")
+    await private_reply(interaction, f"✅ ミッション `#{mission_id}` を追加しました。")
+    await refresh_mission_message(interaction.guild)
 
-@bot.tree.command(name="警告追加", description="メンバーへ運営上の警告記録を追加します。")
+
+@mission_group.command(name="一覧", description="登録されているミッションを表示します")
+@manager_only()
+async def mission_list_command(interaction: discord.Interaction):
+    missions = await db.mission_list(interaction.guild.id)
+    lines = []
+    for m in missions:
+        status = "ON" if m["is_active"] else "OFF"
+        lines.append(
+            f"`#{m['id']}` **{m['name']}** [{status}]\n"
+            f"└ {mission_type_label(m['mission_type'])} / 目標 {m['target_value']} / {m['reward_points']}pt"
+        )
+    embed = discord.Embed(
+        title="🎯 ミッション一覧",
+        description="\n\n".join(lines) if lines else "ミッションはありません。",
+        color=EMBED_COLOR,
+    )
+    await private_reply(interaction, embed=embed)
+
+
+@mission_group.command(name="有効切替", description="ミッションを有効・無効にします")
+@manager_only()
+async def mission_toggle(
+    interaction: discord.Interaction,
+    mission_id: int,
+    有効: bool,
+):
+    ok = await db.mission_set_active(
+        interaction.guild.id,
+        mission_id,
+        有効,
+    )
+    if not ok:
+        return await private_reply(interaction, "❌ ミッションが見つかりません。")
+    await private_reply(interaction, f"✅ ミッション `#{mission_id}` を {'ON' if 有効 else 'OFF'} にしました。")
+    await refresh_mission_message(interaction.guild)
+
+
+@mission_group.command(name="削除", description="ミッションを完全に削除します")
+@manager_only()
+async def mission_delete_command(
+    interaction: discord.Interaction,
+    mission_id: int,
+):
+    ok = await db.mission_delete(interaction.guild.id, mission_id)
+    await private_reply(
+        interaction,
+        "✅ 削除しました。" if ok else "❌ ミッションが見つかりません。",
+    )
+    if ok:
+        await refresh_mission_message(interaction.guild)
+
+
+@mission_group.command(name="手動達成", description="指定メンバーをミッション達成にします")
+@manager_only()
+async def mission_manual_complete(
+    interaction: discord.Interaction,
+    mission_id: int,
+    member: discord.Member,
+):
+    ok = await db.mission_manual_complete(
+        interaction.guild.id,
+        mission_date_jst(),
+        mission_id,
+        member.id,
+    )
+    if not ok:
+        return await private_reply(interaction, "❌ ミッションが見つかりません。")
+    await refresh_mission_message(interaction.guild)
+    await private_reply(interaction, f"✅ {member.mention} をミッション `#{mission_id}` 達成にしました。")
+
+
+@mission_group.command(name="達成一覧", description="指定日のミッション達成者を表示します")
+@manager_only()
+async def mission_completed_list(
+    interaction: discord.Interaction,
+    日付: Optional[str] = None,
+):
+    date_value = 日付 or mission_date_jst()
+    rows = await db.mission_completed(interaction.guild.id, date_value)
+    if not rows:
+        return await private_reply(interaction, f"ℹ️ {date_value} の達成記録はありません。")
+
+    lines = []
+    for row in rows[:50]:
+        status = "✅ 配布済" if row["reward_status"] == "rewarded" else "🎁 配布待ち"
+        lines.append(
+            f"{status} <@{row['user_id']}>｜`#{row['mission_id']}` {row['name']}｜{row['reward_points']}pt"
+        )
+    embed = discord.Embed(
+        title=f"🏆 ミッション達成一覧｜{date_value}",
+        description="\n".join(lines),
+        color=discord.Color.gold(),
+    )
+    await private_reply(interaction, embed=embed)
+
+
+@mission_group.command(name="配布待ち", description="天真爛漫Botでポイントを入れる対象一覧を表示します")
+@manager_only()
+async def mission_pending_list(
+    interaction: discord.Interaction,
+    日付: Optional[str] = None,
+):
+    rows = await db.mission_pending_rewards(interaction.guild.id, 日付)
+    if not rows:
+        return await private_reply(interaction, "✅ 配布待ちはありません。")
+
+    grouped: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        uid = int(row["user_id"])
+        item = grouped.setdefault(uid, {"total": 0, "items": []})
+        item["total"] += int(row["reward_points"])
+        item["items"].append(f"#{row['mission_id']} {row['name']}")
+
+    lines = []
+    for uid, data in list(grouped.items())[:40]:
+        lines.append(
+            f"<@{uid}> → **{data['total']}pt**\n"
+            f"└ {', '.join(data['items'])}"
+        )
+    embed = discord.Embed(
+        title="🎁 ミッション報酬・配布待ち",
+        description="\n\n".join(lines),
+        color=discord.Color.orange(),
+    )
+    embed.set_footer(text="ポイントは天真爛漫Botで付与後、配布済みにしてください")
+    await private_reply(interaction, embed=embed)
+
+
+@mission_group.command(name="配布済み", description="1件の報酬を配布済みにします")
+@manager_only()
+async def mission_rewarded_one(
+    interaction: discord.Interaction,
+    日付: str,
+    mission_id: int,
+    member: discord.Member,
+):
+    ok = await db.mission_mark_rewarded(
+        interaction.guild.id,
+        日付,
+        mission_id,
+        member.id,
+        interaction.user.id,
+    )
+    await private_reply(
+        interaction,
+        "✅ 配布済みにしました。" if ok else "❌ 対象の達成記録が見つかりません。",
+    )
+    if ok and 日付 == mission_date_jst():
+        await refresh_mission_message(interaction.guild)
+
+
+@mission_group.command(name="全件配布済み", description="指定日の配布待ちをすべて配布済みにします")
+@manager_only()
+async def mission_rewarded_all(
+    interaction: discord.Interaction,
+    日付: Optional[str] = None,
+):
+    date_value = 日付 or mission_date_jst()
+    count = await db.mission_mark_all_rewarded(
+        interaction.guild.id,
+        date_value,
+        interaction.user.id,
+    )
+    await private_reply(interaction, f"✅ {date_value} の **{count}件** を配布済みにしました。")
+    if date_value == mission_date_jst():
+        await refresh_mission_message(interaction.guild)
+
+
+bot.tree.add_command(mission_group)
+
+# =========================================================
+# Member management
+# =========================================================
+
+@bot.tree.command(name="警告追加", description="メンバーに運営警告を記録します")
 @app_commands.guilds(target_guild())
 @manager_only()
 async def warning_add(
     interaction: discord.Interaction,
-    メンバー: discord.Member,
-    理由: str,
-) -> None:
+    member: discord.Member,
+    reason: str,
+):
     warning_id = await db.add_warning(
-        interaction.guild_id,
-        メンバー.id,
+        interaction.guild.id,
+        member.id,
         interaction.user.id,
-        理由,
+        reason,
     )
-    await db.add_member_event(
-        interaction.guild_id,
-        メンバー.id,
+    await db.add_event(
+        interaction.guild.id,
+        member.id,
         "warning",
         interaction.user.id,
-        f"警告ID={warning_id}; {理由}",
+        reason,
     )
-    await send_log(
-        interaction.guild,
-        title="⚠️ 警告追加",
-        description=(
-            f"警告ID: **#{warning_id}**\n"
-            f"対象: {メンバー.mention}\n"
-            f"登録者: {interaction.user.mention}\n"
-            f"理由: {理由}"
-        ),
-        color=discord.Color.red(),
-    )
-    await private_reply(interaction, content=f"✅ 警告 #{warning_id} を登録しました。")
+    await private_reply(interaction, f"✅ 警告 `#{warning_id}` を記録しました。")
 
-@bot.tree.command(name="警告一覧", description="メンバーの警告履歴を表示します。")
+
+@bot.tree.command(name="警告一覧", description="メンバーの警告履歴を確認します")
 @app_commands.guilds(target_guild())
 @manager_only()
 async def warning_list(
     interaction: discord.Interaction,
-    メンバー: discord.Member,
-    解決済みも表示: bool = False,
-) -> None:
-    rows = await db.warnings(
-        interaction.guild_id,
-        メンバー.id,
-        active_only=not 解決済みも表示,
-    )
+    member: discord.Member,
+):
+    rows = await db.warnings(interaction.guild.id, member.id)
+    lines = []
+    for row in rows:
+        status = "有効" if row["is_active"] else "解決済み"
+        dt = parse_dt(row["created_at"])
+        lines.append(
+            f"`#{row['id']}` **{status}** {fmt_dt(dt, 'd')}\n"
+            f"└ {truncate(row['reason'], 250)}"
+        )
     embed = discord.Embed(
-        title=f"⚠️ 警告一覧｜{メンバー.display_name}",
-        color=discord.Color.red(),
-        timestamp=utcnow(),
+        title=f"⚠️ {member.display_name}の警告",
+        description="\n\n".join(lines) if lines else "警告はありません。",
+        color=discord.Color.orange(),
     )
-    if not rows:
-        embed.description = "該当する警告はありません。"
-    else:
-        lines = []
-        for row in rows:
-            state = "有効" if row["is_active"] else "解決済み"
-            lines.append(
-                f"**#{row['id']} [{state}]** {fmt_dt(parse_dt(row['created_at']), 'd')}\n"
-                f"登録: <@{row['moderator_id']}>\n"
-                f"{safe_text(row['reason'], 300)}"
-            )
-        embed.description = "\n\n".join(lines)[:4000]
     await private_reply(interaction, embed=embed)
 
-@bot.tree.command(name="警告解決", description="警告を解決済みに変更します。")
-@app_commands.guilds(target_guild())
-@manager_only()
-async def warning_resolve(interaction: discord.Interaction, 警告id: int) -> None:
-    ok = await db.resolve_warning(interaction.guild_id, 警告id, interaction.user.id)
-    if not ok:
-        await private_reply(interaction, content="❌ 有効な警告IDが見つかりません。")
-        return
-    await private_reply(interaction, content=f"✅ 警告 #{警告id} を解決済みにしました。")
 
-@bot.tree.command(name="メモ設定", description="メンバーの運営メモを保存・上書きします。")
+@bot.tree.command(name="警告解決", description="警告を解決済みにします")
 @app_commands.guilds(target_guild())
 @manager_only()
-async def note_set(
-    interaction: discord.Interaction,
-    メンバー: discord.Member,
-    メモ: str,
-) -> None:
-    await db.set_note(interaction.guild_id, メンバー.id, メモ, interaction.user.id)
-    await send_log(
-        interaction.guild,
-        title="🗒️ 運営メモ更新",
-        description=(
-            f"対象: {メンバー.mention}\n"
-            f"更新者: {interaction.user.mention}\n"
-            f"内容: {safe_text(メモ)}"
-        ),
-        color=discord.Color.gold(),
+async def warning_resolve(interaction: discord.Interaction, warning_id: int):
+    ok = await db.resolve_warning(
+        interaction.guild.id,
+        warning_id,
+        interaction.user.id,
     )
-    await private_reply(interaction, content=f"✅ {メンバー.mention} のメモを保存しました。")
+    await private_reply(
+        interaction,
+        "✅ 解決済みにしました。" if ok else "❌ 有効な警告が見つかりません。",
+    )
 
-@bot.tree.command(name="新規vc未参加", description="指定期間内に加入し、まだVCへ参加していない人を表示します。")
+
+@bot.tree.command(name="管理メモ", description="メンバーの運営メモを保存します")
 @app_commands.guilds(target_guild())
 @manager_only()
-async def new_no_vc(
+async def member_note(
     interaction: discord.Interaction,
-    日数: app_commands.Range[int, 1, 90] = 30,
-) -> None:
-    since = utcnow() - timedelta(days=日数)
-    rows = await db.new_without_vc(interaction.guild_id, since, 50)
+    member: discord.Member,
+    note: str,
+):
+    await db.set_note(
+        interaction.guild.id,
+        member.id,
+        note,
+        interaction.user.id,
+    )
+    await private_reply(interaction, f"✅ {member.mention} の管理メモを保存しました。")
+
+
+@bot.tree.command(name="メンバーカルテ", description="メンバーの管理情報を確認します")
+@app_commands.guilds(target_guild())
+@manager_only()
+async def member_card(
+    interaction: discord.Interaction,
+    member: discord.Member,
+):
+    data = await db.member_card(interaction.guild.id, member.id)
+    raw_member = data["member"] or {}
+    note = data["note"]
 
     embed = discord.Embed(
-        title=f"🌱 新規VC未参加（直近{日数}日）",
+        title=f"📋 {member.display_name}のカルテ",
+        description=f"{member.mention}\nID: `{member.id}`",
         color=EMBED_COLOR,
         timestamp=utcnow(),
     )
-    if not rows:
-        embed.description = "対象者はいません。"
-    else:
-        embed.description = "\n".join(
-            f"• <@{row['user_id']}> — 加入 {fmt_dt(parse_dt(row['joined_at']), 'R')}"
-            for row in rows
-        )[:4000]
-        embed.set_footer(text=f"{len(rows)}人を表示")
+    embed.add_field(
+        name="加入",
+        value=fmt_dt(parse_dt(raw_member.get("joined_at"))),
+        inline=True,
+    )
+    embed.add_field(
+        name="最終VC",
+        value=fmt_dt(parse_dt(data["last_vc"]), "R"),
+        inline=True,
+    )
+    embed.add_field(
+        name="VC実績",
+        value=f"{data['sessions']}回 / {fmt_duration(data['seconds'])}",
+        inline=True,
+    )
+    embed.add_field(name="有効警告", value=f"{data['warnings']}件", inline=True)
+    embed.add_field(
+        name="管理メモ",
+        value=truncate(note["note"] if note else "なし"),
+        inline=False,
+    )
     await private_reply(interaction, embed=embed)
 
-@bot.tree.command(name="vc休眠一覧", description="指定日数以上VCへ参加していない人を表示します。")
+
+@bot.tree.command(name="タイムアウト", description="メンバーをタイムアウトします")
 @app_commands.guilds(target_guild())
 @manager_only()
-async def inactive_list(
+async def timeout_member(
     interaction: discord.Interaction,
-    日数: app_commands.Range[int, 1, 365] = 7,
-) -> None:
-    cutoff = utcnow() - timedelta(days=日数)
-    rows = await db.inactive_vc(interaction.guild_id, cutoff, 50)
-
-    embed = discord.Embed(
-        title=f"🌙 VC休眠一覧（{日数}日以上）",
-        description="※このBotが記録したVC最終参加日時を基準にしています。",
-        color=discord.Color.dark_purple(),
-        timestamp=utcnow(),
-    )
-    if not rows:
-        embed.add_field(name="結果", value="対象者はいません。", inline=False)
-    else:
-        lines = []
-        for row in rows:
-            last = parse_dt(row["last_vc_at"])
-            label = fmt_dt(last, "R") if last else "VC記録なし"
-            lines.append(f"• <@{row['user_id']}> — {label}")
-        embed.add_field(name="対象者（最大50人）", value="\n".join(lines)[:4000], inline=False)
-    await private_reply(interaction, embed=embed)
-
-@bot.tree.command(name="管理ダッシュボード", description="管理チャンネルに自動更新ダッシュボードを設置します。")
-@app_commands.guilds(target_guild())
-@manager_only()
-async def dashboard_create(interaction: discord.Interaction) -> None:
-    channel = interaction.guild.get_channel(DASHBOARD_CHANNEL_ID)
-    if not isinstance(channel, discord.TextChannel):
-        await private_reply(interaction, content="❌ ダッシュボード用チャンネルが見つかりません。")
-        return
-
-    embed = await build_dashboard_embed(interaction.guild)
-    message = await channel.send(embed=embed)
-    await db.set_setting(interaction.guild_id, "dashboard_message_id", str(message.id))
-    await private_reply(interaction, content=f"✅ ダッシュボードを {channel.mention} に設置しました。")
-
-EXPORT_CHOICES = [
-    app_commands.Choice(name="VC履歴", value="vc"),
-    app_commands.Choice(name="面接記録", value="面接"),
-    app_commands.Choice(name="警告記録", value="警告"),
-    app_commands.Choice(name="メンバー一覧", value="メンバー"),
-]
-
-@bot.tree.command(name="データ出力", description="管理データをCSVで出力します。")
-@app_commands.choices(種類=EXPORT_CHOICES)
-@app_commands.guilds(target_guild())
-@manager_only()
-async def data_export(
-    interaction: discord.Interaction,
-    種類: app_commands.Choice[str],
-) -> None:
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    headers, rows = await db.export_rows(interaction.guild_id, 種類.value)
-
-    buffer = io.StringIO()
-    writer = csv.writer(buffer)
-    writer.writerow(headers)
-    for row in rows:
-        writer.writerow([row[h] for h in headers])
-
-    raw = buffer.getvalue().encode("utf-8-sig")
-    filename = f"puraudhia_{種類.value}_{local_now().strftime('%Y%m%d_%H%M')}.csv"
-    file = discord.File(io.BytesIO(raw), filename=filename)
-    await private_reply(interaction, content=f"✅ {len(rows)}件を出力しました。", file=file)
-
-
-# =========================================================
-# 放課後ミッション Slash Commands
-# =========================================================
-
-@bot.tree.command(
-    name="今日のミッション",
-    description="本日の放課後ミッションを表示します。",
-)
-@app_commands.guilds(target_guild())
-async def today_missions(
-    interaction: discord.Interaction,
-) -> None:
-    date_key = mission_date_key()
-    missions = await db.ensure_daily_missions(
-        interaction.guild_id,
-        date_key,
-    )
-    await private_reply(
-        interaction,
-        embed=mission_board_embed(missions, date_key),
-    )
-
-@bot.tree.command(
-    name="ミッション進捗",
-    description="自分の今日のミッション進捗を確認します。",
-)
-@app_commands.guilds(target_guild())
-async def mission_progress(
-    interaction: discord.Interaction,
-) -> None:
-    date_key = mission_date_key()
-    await db.ensure_daily_missions(
-        interaction.guild_id,
-        date_key,
-    )
-    rows = await db.get_user_mission_progress(
-        interaction.guild_id,
-        date_key,
-        interaction.user.id,
-    )
-
-    embed = discord.Embed(
-        title="🎮 今日のミッション進捗",
-        description=f"{interaction.user.mention} の進捗",
-        color=EMBED_COLOR,
-        timestamp=utcnow(),
-    )
-
-    for row in rows:
-        progress_minutes = int(row["progress_seconds"]) // 60
-        target = int(row["target"])
-        complete = bool(row["completed_at"])
-        status = "✅ COMPLETE" if complete else f"{progress_minutes}/{target}分"
-        embed.add_field(
-            name=f"{difficulty_emoji(row['difficulty'])} {row['name']}",
-            value=(
-                f"{row['description']}\n"
-                f"進捗：**{status}**\n"
-                f"報酬予定：**{row['reward']}pt**"
-            ),
-            inline=False,
-        )
-
-    await private_reply(interaction, embed=embed)
-
-@bot.tree.command(
-    name="ミッションチャンネル設定",
-    description="現在のチャンネルをミッション掲示先に設定します。",
-)
-@app_commands.guilds(target_guild())
-@manager_only()
-async def mission_channel_set(
-    interaction: discord.Interaction,
-) -> None:
-    if not isinstance(interaction.channel, discord.TextChannel):
-        await private_reply(
-            interaction,
-            content="❌ テキストチャンネルで実行してください。",
-        )
-        return
-
-    await db.set_setting(
-        interaction.guild_id,
-        "mission_channel_id",
-        str(interaction.channel.id),
-    )
-    await private_reply(
-        interaction,
-        content=(
-            f"✅ {interaction.channel.mention} を"
-            "ミッション掲示チャンネルに設定しました。"
-        ),
-    )
-
-@bot.tree.command(
-    name="ミッション掲示",
-    description="今日のミッションを設定済みチャンネルへ掲示します。",
-)
-@app_commands.guilds(target_guild())
-@manager_only()
-async def mission_post(
-    interaction: discord.Interaction,
-) -> None:
-    ok = await post_daily_missions(interaction.guild)
-    await private_reply(
-        interaction,
-        content=(
-            "✅ 今日のミッションを掲示しました。"
-            if ok
-            else "❌ 先に /ミッションチャンネル設定 を実行してください。"
-        ),
-    )
-
-@bot.tree.command(
-    name="ミッション再抽選",
-    description="本日のミッションを3つ再抽選します。",
-)
-@app_commands.guilds(target_guild())
-@manager_only()
-async def mission_reroll(
-    interaction: discord.Interaction,
-) -> None:
-    ok = await post_daily_missions(
-        interaction.guild,
-        reroll=True,
-    )
-    await private_reply(
-        interaction,
-        content=(
-            "✅ 本日のミッションを再抽選して掲示しました。"
-            if ok
-            else (
-                "✅ 再抽選しました。"
-                "掲示する場合は先にチャンネル設定をしてください。"
-            )
-        ),
-    )
-
-@bot.tree.command(
-    name="報酬一覧",
-    description="未付与のミッション報酬一覧を表示します。",
-)
-@app_commands.guilds(target_guild())
-@manager_only()
-async def rewards_list(
-    interaction: discord.Interaction,
-) -> None:
-    rows = await db.pending_rewards(interaction.guild_id, 100)
-    embed = discord.Embed(
-        title="💰 ミッション報酬待ち一覧",
-        color=discord.Color.gold(),
-        timestamp=utcnow(),
-    )
-
-    if not rows:
-        embed.description = "現在、未付与の報酬はありません。"
-    else:
-        grouped: dict[int, dict[str, Any]] = {}
-        for row in rows:
-            item = grouped.setdefault(
-                int(row["user_id"]),
-                {"points": 0, "rewards": []},
-            )
-            item["points"] += int(row["points"])
-            item["rewards"].append(
-                f"#{row['id']} {row['mission_name']}（{row['points']}pt）"
-            )
-
-        lines = []
-        for user_id, item in grouped.items():
-            lines.append(
-                f"<@{user_id}>　合計 **{item['points']}pt**\n"
-                + "\n".join(f"└ {x}" for x in item["rewards"])
-            )
-        embed.description = "\n\n".join(lines)[:4000]
-        embed.set_footer(
-            text="付与後：/報酬完了 または /報酬一括完了"
-        )
-
-    await private_reply(interaction, embed=embed)
-
-@bot.tree.command(
-    name="報酬完了",
-    description="指定した報酬IDを付与済みにします。",
-)
-@app_commands.guilds(target_guild())
-@manager_only()
-async def reward_complete(
-    interaction: discord.Interaction,
-    報酬id: int,
-) -> None:
-    ok = await db.complete_reward(
-        interaction.guild_id,
-        報酬id,
-        interaction.user.id,
-    )
-    await private_reply(
-        interaction,
-        content=(
-            f"✅ 報酬 #{報酬id} を付与済みにしました。"
-            if ok
-            else "❌ 未付与の報酬IDが見つかりません。"
-        ),
-    )
-
-@bot.tree.command(
-    name="報酬一括完了",
-    description="未付与の報酬をすべて付与済みにします。",
-)
-@app_commands.guilds(target_guild())
-@manager_only()
-async def rewards_complete_all(
-    interaction: discord.Interaction,
-) -> None:
-    count = await db.complete_all_rewards(
-        interaction.guild_id,
-        interaction.user.id,
-    )
-    await private_reply(
-        interaction,
-        content=f"✅ {count}件の報酬を付与済みにしました。",
-    )
-
-# =========================================================
-# 定期処理
-# =========================================================
-
-
-@tasks.loop(seconds=MISSION_CHECK_SECONDS)
-async def mission_progress_loop() -> None:
-    guild = bot.get_guild(GUILD_ID)
-    if not guild:
-        return
-
-    date_key = mission_date_key()
-    missions = await db.ensure_daily_missions(
-        guild.id,
-        date_key,
-    )
-
-    for channel in list(guild.voice_channels) + list(guild.stage_channels):
-        if is_excluded_channel(channel):
-            continue
-
-        members = [
-            m for m in channel.members
-            if should_track_member(m)
-        ]
-        if not members:
-            continue
-
-        people_count = len(members)
-        channel_name_lower = channel.name.lower()
-        is_game_channel = any(
-            keyword.lower() in channel_name_lower
-            for keyword in GAME_CHANNEL_KEYWORDS
-        )
-
-        hour = local_now().hour
-        is_night = hour >= 22 or hour < 2
-
-        for member in members:
-            for mission in missions:
-                kind = mission["kind"]
-                qualifies = False
-
-                if kind == "vc_minutes":
-                    qualifies = True
-                elif kind == "group_minutes":
-                    qualifies = people_count >= int(
-                        mission["required_people"]
-                    )
-                elif kind == "game_minutes":
-                    qualifies = is_game_channel
-                elif kind == "night_minutes":
-                    qualifies = is_night
-
-                if not qualifies:
-                    continue
-
-                _, completed_now = await db.increment_mission_progress(
-                    guild.id,
-                    date_key,
-                    member.id,
-                    mission,
-                    MISSION_CHECK_SECONDS,
-                )
-
-                if completed_now:
-                    await announce_mission_complete(
-                        guild,
-                        member,
-                        mission,
-                    )
-                    await send_log(
-                        guild,
-                        title="🎯 ミッション達成・報酬待ち",
-                        description=(
-                            f"対象: {member.mention}\n"
-                            f"ミッション: **{mission['name']}**\n"
-                            f"付与予定: **{mission['reward']}pt**\n"
-                            "管理者は /報酬一覧 を確認してください。"
-                        ),
-                        color=discord.Color.green(),
-                    )
-
-@mission_progress_loop.before_loop
-async def before_mission_progress_loop() -> None:
-    await bot.wait_until_ready()
-
-@tasks.loop(minutes=1)
-async def mission_daily_post_loop() -> None:
-    now = local_now()
-    if now.hour != 0 or now.minute != 1:
-        return
-
-    guild = bot.get_guild(GUILD_ID)
-    if not guild:
-        return
-
-    today = mission_date_key()
-    last_posted = await db.get_setting(
-        guild.id,
-        "last_mission_post_date",
-    )
-    if last_posted == today:
-        return
-
-    await db.ensure_daily_missions(guild.id, today)
-    posted = await post_daily_missions(guild)
-    if posted:
-        await db.set_setting(
-            guild.id,
-            "last_mission_post_date",
-            today,
-        )
-
-@mission_daily_post_loop.before_loop
-async def before_mission_daily_post_loop() -> None:
-    await bot.wait_until_ready()
-
-@tasks.loop(minutes=DASHBOARD_UPDATE_MINUTES)
-async def dashboard_loop() -> None:
-    guild = bot.get_guild(GUILD_ID)
-    if not guild:
-        return
-
-    message_id = await db.get_setting(guild.id, "dashboard_message_id")
-    if not message_id:
-        return
-
-    channel = guild.get_channel(DASHBOARD_CHANNEL_ID)
-    if not isinstance(channel, discord.TextChannel):
-        return
-
+    member: discord.Member,
+    minutes: app_commands.Range[int, 1, 40320],
+    reason: Optional[str] = None,
+):
+    until = utcnow() + timedelta(minutes=minutes)
     try:
-        message = await channel.fetch_message(int(message_id))
-        await message.edit(embed=await build_dashboard_embed(guild))
-    except discord.NotFound:
-        await db.set_setting(guild.id, "dashboard_message_id", "")
-    except discord.HTTPException:
-        log.exception("ダッシュボード更新に失敗しました")
-
-@dashboard_loop.before_loop
-async def before_dashboard_loop() -> None:
-    await bot.wait_until_ready()
-
-@tasks.loop(minutes=1)
-async def daily_summary_loop() -> None:
-    now = local_now()
-    if now.hour != DAILY_SUMMARY_HOUR or now.minute != DAILY_SUMMARY_MINUTE:
-        return
-
-    guild = bot.get_guild(GUILD_ID)
-    if not guild:
-        return
-
-    today_key = now.strftime("%Y-%m-%d")
-    sent_key = await db.get_setting(guild.id, "last_daily_summary")
-    if sent_key == today_key:
-        return
-
-    start, end = local_day_bounds(1)
-    stats = await db.stats(guild.id, start, end)
-    stats = add_participation_data(stats, guild)
-
-    channel = guild.get_channel(MANAGEMENT_LOG_CHANNEL_ID)
-    if isinstance(channel, discord.TextChannel):
-        embed = stats_embed(
-            f"📅 日次レポート｜{start.astimezone(TZ).date()}",
-            stats,
+        await member.timeout(until, reason=audit_reason(reason, interaction.user))
+        await db.add_event(
+            interaction.guild.id,
+            member.id,
+            "timeout",
+            interaction.user.id,
+            reason,
         )
-        try:
-            await channel.send(embed=embed)
-            await db.set_setting(guild.id, "last_daily_summary", today_key)
-        except discord.HTTPException:
-            log.exception("日次レポート送信に失敗しました")
+        await private_reply(interaction, f"✅ {member.mention} を{minutes}分タイムアウトしました。")
+    except discord.Forbidden:
+        await private_reply(interaction, "❌ 権限またはロール順位を確認してください。")
 
-@daily_summary_loop.before_loop
-async def before_daily_summary_loop() -> None:
-    await bot.wait_until_ready()
+
+@bot.tree.command(name="タイムアウト解除", description="タイムアウトを解除します")
+@app_commands.guilds(target_guild())
+@manager_only()
+async def timeout_remove(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: Optional[str] = None,
+):
+    try:
+        await member.timeout(None, reason=audit_reason(reason, interaction.user))
+        await private_reply(interaction, f"✅ {member.mention} のタイムアウトを解除しました。")
+    except discord.Forbidden:
+        await private_reply(interaction, "❌ 権限またはロール順位を確認してください。")
+
+
+@bot.tree.command(name="キック", description="メンバーをサーバーからKickします")
+@app_commands.guilds(target_guild())
+@manager_only()
+async def kick_member(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: Optional[str] = None,
+):
+    try:
+        await member.kick(reason=audit_reason(reason, interaction.user))
+        await private_reply(interaction, f"✅ {member} をKickしました。")
+    except discord.Forbidden:
+        await private_reply(interaction, "❌ Kickできません。権限とロール順位を確認してください。")
+
+
+@bot.tree.command(name="BAN", description="メンバーをBANします")
+@app_commands.guilds(target_guild())
+@manager_only()
+async def ban_member(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: Optional[str] = None,
+):
+    try:
+        await member.ban(reason=audit_reason(reason, interaction.user))
+        await private_reply(interaction, f"✅ {member} をBANしました。")
+    except discord.Forbidden:
+        await private_reply(interaction, "❌ BANできません。権限とロール順位を確認してください。")
+
 
 # =========================================================
-# エラー処理
+# Channel management
+# =========================================================
+
+@bot.tree.command(name="チャンネルロック", description="指定テキストチャンネルを一般メンバー書込不可にします")
+@app_commands.guilds(target_guild())
+@manager_only()
+async def channel_lock(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+):
+    overwrite = channel.overwrites_for(interaction.guild.default_role)
+    overwrite.send_messages = False
+    await channel.set_permissions(
+        interaction.guild.default_role,
+        overwrite=overwrite,
+        reason=audit_reason("チャンネルロック", interaction.user),
+    )
+    await private_reply(interaction, f"🔒 {channel.mention} をロックしました。")
+
+
+@bot.tree.command(name="チャンネル解除", description="指定テキストチャンネルの書込設定を未指定に戻します")
+@app_commands.guilds(target_guild())
+@manager_only()
+async def channel_unlock(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+):
+    overwrite = channel.overwrites_for(interaction.guild.default_role)
+    overwrite.send_messages = None
+    if overwrite.is_empty():
+        overwrite = None
+    await channel.set_permissions(
+        interaction.guild.default_role,
+        overwrite=overwrite,
+        reason=audit_reason("チャンネルロック解除", interaction.user),
+    )
+    await private_reply(interaction, f"🔓 {channel.mention} のロックを解除しました。")
+
+
+@bot.tree.command(name="一括お知らせ", description="指定チャンネルへ運営告知を送信します")
+@app_commands.guilds(target_guild())
+@manager_only()
+async def announcement(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    title: str,
+    message: str,
+):
+    embed = discord.Embed(
+        title=title,
+        description=message,
+        color=EMBED_COLOR,
+        timestamp=utcnow(),
+    )
+    embed.set_footer(text=f"運営: {interaction.user.display_name}")
+    await channel.send(embed=embed)
+    await private_reply(interaction, f"✅ {channel.mention} に送信しました。")
+
+
+# =========================================================
+# Backup / status
+# =========================================================
+
+@bot.tree.command(name="設定確認", description="現在の管理Bot設定を確認します")
+@app_commands.guilds(target_guild())
+@manager_only()
+async def settings_check(interaction: discord.Interaction):
+    admin_role_id = int(await db.get_setting(interaction.guild.id, "admin_role_id", ADMIN_ROLE_ID))
+    admin_role = interaction.guild.get_role(admin_role_id)
+    management_log = await get_setting_channel(
+        interaction.guild,
+        "management_log_channel_id",
+        MANAGEMENT_LOG_CHANNEL_ID,
+    )
+    join_log = await get_setting_channel(
+        interaction.guild,
+        "join_leave_log_channel_id",
+        JOIN_LEAVE_LOG_CHANNEL_ID,
+    )
+    dashboard = await get_setting_channel(
+        interaction.guild,
+        "dashboard_channel_id",
+        DASHBOARD_CHANNEL_ID,
+    )
+    holiday_active = await db.get_setting(interaction.guild.id, "holiday_active", "0")
+    holiday_auto = await db.get_setting(interaction.guild.id, "holiday_auto", "0")
+
+    embed = discord.Embed(title="⚙️ 管理Bot設定", color=EMBED_COLOR)
+    embed.add_field(
+        name="管理ロール",
+        value=admin_role.mention if admin_role else "未設定",
+        inline=False,
+    )
+    embed.add_field(
+        name="管理ログ",
+        value=management_log.mention if management_log else "未設定",
+        inline=True,
+    )
+    embed.add_field(
+        name="入退室ログ",
+        value=join_log.mention if join_log else "未設定",
+        inline=True,
+    )
+    embed.add_field(
+        name="ダッシュボード",
+        value=dashboard.mention if dashboard else "未設定",
+        inline=True,
+    )
+    embed.add_field(
+        name="Holiday",
+        value=(
+            f"状態：{'休止中' if holiday_active == '1' else '通常'}\n"
+            f"土日自動：{'ON' if holiday_auto == '1' else 'OFF'}"
+        ),
+        inline=False,
+    )
+    await private_reply(interaction, embed=embed)
+
+
+@bot.tree.command(name="設定バックアップ", description="管理Bot設定をJSONで出力します")
+@app_commands.guilds(target_guild())
+@manager_only()
+async def settings_backup(interaction: discord.Interaction):
+    payload = await db.settings_export(interaction.guild.id)
+    payload["exported_at"] = to_iso()
+    raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    file = discord.File(
+        io.BytesIO(raw),
+        filename=f"management_settings_{interaction.guild.id}.json",
+    )
+    await private_reply(interaction, "✅ 設定バックアップです。", file=file)
+
+
+# =========================================================
+# Error / start
 # =========================================================
 
 @bot.tree.error
-async def on_app_command_error(
+async def app_error(
     interaction: discord.Interaction,
     error: app_commands.AppCommandError,
-) -> None:
+):
     if isinstance(error, app_commands.CheckFailure):
-        await private_reply(interaction, content="❌ このコマンドは運営専用です。")
-        return
+        message = "❌ このコマンドは運営専用です。"
+    else:
+        original = getattr(error, "original", error)
+        log.exception(
+            "Slash command error",
+            exc_info=(type(original), original, original.__traceback__),
+        )
+        message = f"❌ エラーが発生しました：`{type(original).__name__}`"
 
-    log.exception("Slash command error", exc_info=error)
-    await private_reply(
-        interaction,
-        content="❌ コマンド実行中にエラーが発生しました。コンソールログを確認してください。",
-    )
+    try:
+        await private_reply(interaction, message)
+    except discord.HTTPException:
+        pass
 
-# =========================================================
-# 起動
-# =========================================================
 
 if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN が設定されていません。")
+    raise RuntimeError(
+        "環境変数 DISCORD_TOKEN が設定されていません。"
+    )
 
-bot.run(TOKEN, log_handler=None)
+bot.run(TOKEN)
