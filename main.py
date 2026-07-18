@@ -1156,45 +1156,85 @@ async def apply_holiday(guild: discord.Guild, actor: Optional[discord.abc.User] 
         return False, "対象カテゴリーが登録されていません。"
 
     await db.clear_permission_backups(guild.id)
-    everyone = guild.default_role
+
+    configured_admin_role_id = await db.get_setting(
+        guild.id,
+        "admin_role_id",
+        str(ADMIN_ROLE_ID),
+    )
+    try:
+        admin_role_id = int(configured_admin_role_id or 0)
+    except ValueError:
+        admin_role_id = ADMIN_ROLE_ID
+
+    # 管理者・Bot管理用ロールは除外。
+    # @everyone と一般ロールすべてへ明示的な拒否を設定する。
+    protected_role_ids = {admin_role_id}
+    if guild.me:
+        protected_role_ids.update(role.id for role in guild.me.roles)
+
+    target_roles = [
+        role
+        for role in guild.roles
+        if not role.is_bot_managed()
+        and role.id not in protected_role_ids
+    ]
 
     changed = 0
+    failed = 0
+
     for channel in channels:
-        overwrite = channel.overwrites_for(everyone)
-        await db.save_permission_backup(
-            guild.id,
-            channel.id,
-            everyone.id,
-            "role",
-            overwrite,
-        )
-
-        new_overwrite = channel.overwrites_for(everyone)
-
-        if isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
-            # VCは表示を残し、接続と発言を不可にする
-            new_overwrite.connect = False
-            new_overwrite.speak = False
-        elif isinstance(channel, (discord.TextChannel, discord.ForumChannel)):
-            # テキストは閲覧を残し、投稿のみ不可にする
-            new_overwrite.send_messages = False
-            new_overwrite.add_reactions = False
-            new_overwrite.create_public_threads = False
-            new_overwrite.send_messages_in_threads = False
-        else:
+        if not isinstance(
+            channel,
+            (
+                discord.VoiceChannel,
+                discord.StageChannel,
+                discord.TextChannel,
+                discord.ForumChannel,
+            ),
+        ):
             continue
 
-        try:
-            await channel.set_permissions(
-                everyone,
-                overwrite=new_overwrite,
-                reason="Holidayお休みモード開始",
+        for role in target_roles:
+            original = channel.overwrites_for(role)
+
+            await db.save_permission_backup(
+                guild.id,
+                channel.id,
+                role.id,
+                "role",
+                original,
             )
-            changed += 1
-        except discord.Forbidden:
-            log.warning("権限変更不可: %s", channel)
-        except discord.HTTPException:
-            log.exception("権限変更失敗: %s", channel)
+
+            overwrite = channel.overwrites_for(role)
+
+            if isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+                # お休み中はVC自体を一覧から非表示にする
+                overwrite.view_channel = False
+                overwrite.connect = False
+                overwrite.speak = False
+
+            elif isinstance(channel, (discord.TextChannel, discord.ForumChannel)):
+                # お休み中はテキスト・フォーラム自体を一覧から非表示にする
+                overwrite.view_channel = False
+                overwrite.send_messages = False
+                overwrite.add_reactions = False
+                overwrite.create_public_threads = False
+                overwrite.send_messages_in_threads = False
+
+            try:
+                await channel.set_permissions(
+                    role,
+                    overwrite=overwrite,
+                    reason="Holidayお休みモード開始",
+                )
+                changed += 1
+            except discord.Forbidden:
+                failed += 1
+                log.warning("権限変更不可: %s / %s", channel, role)
+            except discord.HTTPException:
+                failed += 1
+                log.exception("権限変更失敗: %s / %s", channel, role)
 
     await db.set_setting(guild.id, "holiday_active", "1")
     await db.set_setting(guild.id, "holiday_started_at", to_iso())
@@ -1202,14 +1242,22 @@ async def apply_holiday(guild: discord.Guild, actor: Optional[discord.abc.User] 
 
     embed = discord.Embed(
         title="🌙 Holidayモード開始",
-        description=f"対象カテゴリー内の **{changed}チャンネル** を休止しました。",
+        description=(
+            f"対象カテゴリーへ **{changed}件** の休止権限を設定しました。\n"
+            f"失敗：**{failed}件**\n\n"
+            "管理者ロールとBot管理ロール以外には、対象VC・テキストが表示されません。"
+        ),
         color=discord.Color.dark_purple(),
         timestamp=utcnow(),
     )
     if actor:
         embed.set_footer(text=f"実行者: {actor}")
     await send_log(guild, embed)
-    return True, f"{changed}チャンネルを休止しました。"
+
+    return True, (
+        f"Holidayモードを開始しました。設定成功：{changed}件、失敗：{failed}件。\n"
+        "※対象VC・テキストは一般メンバーから完全に非表示になります。"
+    )
 
 
 async def restore_holiday(guild: discord.Guild, actor: Optional[discord.abc.User] = None):
@@ -2477,7 +2525,7 @@ async def kick_member(
         await private_reply(interaction, "❌ Kickできません。権限とロール順位を確認してください。")
 
 
-@bot.tree.command(name="ban", description="メンバーをBANします")
+@bot.tree.command(name="BAN", description="メンバーをBANします")
 @app_commands.guilds(target_guild())
 @manager_only()
 async def ban_member(
