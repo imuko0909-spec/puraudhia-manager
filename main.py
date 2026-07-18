@@ -2477,7 +2477,7 @@ async def kick_member(
         await private_reply(interaction, "❌ Kickできません。権限とロール順位を確認してください。")
 
 
-@bot.tree.command(name="BAN", description="メンバーをBANします")
+@bot.tree.command(name="ban", description="メンバーをBANします")
 @app_commands.guilds(target_guild())
 @manager_only()
 async def ban_member(
